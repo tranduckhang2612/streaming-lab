@@ -1,0 +1,323 @@
+name: streaming-lab
+
+services:
+  kafka:
+    image: apache/kafka:4.2.2
+    container_name: streaming-kafka
+    hostname: kafka
+    restart: unless-stopped
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    environment:
+      # Single-node KRaft: one process acts as both broker and controller.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # INTERNAL is for containers; EXTERNAL is for programs on the host.
+      KAFKA_LISTENERS: INTERNAL://:29092,CONTROLLER://:29093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:${KAFKA_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:29092 --list >/dev/null 2>&1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - streaming-network
+
+  kafka-init:
+    image: apache/kafka:4.2.2
+    container_name: streaming-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists --topic raw-events \
+          --partitions ${KAFKA_TOPIC_PARTITIONS:-3} --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists --topic raw-events-p1 \
+          --partitions 1 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists --topic raw-events-p3 \
+          --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists --topic raw-events-p6 \
+          --partitions 6 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists --topic window-results \
+          --partitions ${KAFKA_TOPIC_PARTITIONS:-3} --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+          --create --if-not-exists --topic late-events \
+          --partitions ${KAFKA_TOPIC_PARTITIONS:-3} --replication-factor 1
+    networks:
+      - streaming-network
+
+  event-generator:
+    build:
+      context: .
+      dockerfile: producer/Dockerfile
+    container_name: streaming-event-generator
+    profiles: ["generator"]
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    command:
+      - --bootstrap-servers
+      - kafka:29092
+      - --topic
+      - "${GENERATOR_TOPIC:-raw-events}"
+      - --rate
+      - "${GENERATOR_RATE:-10}"
+      - --late-ratio
+      - "${GENERATOR_LATE_RATIO:-0.10}"
+      - --late-delay-seconds
+      - "${GENERATOR_LATE_DELAY_SECONDS:-45}"
+      - --account-count
+      - "${GENERATOR_ACCOUNT_COUNT:-20}"
+      - --merchant-count
+      - "${GENERATOR_MERCHANT_COUNT:-50}"
+      - --min-amount-vnd
+      - "${GENERATOR_MIN_AMOUNT_VND:-10000}"
+      - --max-amount-vnd
+      - "${GENERATOR_MAX_AMOUNT_VND:-5000000}"
+      - --duration-seconds
+      - "${GENERATOR_DURATION_SECONDS:-60}"
+      - --seed
+      - "${GENERATOR_SEED:-42}"
+    networks:
+      - streaming-network
+
+  spark-master:
+    image: spark:4.2.0-scala2.13-java17-python3-ubuntu
+    container_name: streaming-spark-master
+    hostname: spark-master
+    restart: unless-stopped
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "${SPARK_MASTER_PORT:-7077}:7077"
+      - "${SPARK_MASTER_UI_PORT:-8080}:8080"
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_LOCAL_IP: spark-master
+    volumes:
+      - ./spark-apps:/opt/spark/apps:ro
+      - spark-data:/opt/spark/work-dir
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/spark-master/7077'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - streaming-network
+
+  spark-worker:
+    image: spark:4.2.0-scala2.13-java17-python3-ubuntu
+    container_name: streaming-spark-worker
+    hostname: spark-worker
+    restart: unless-stopped
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --host
+      - spark-worker
+      - --webui-port
+      - "8081"
+      - --cores
+      - "${SPARK_WORKER_CORES:-2}"
+      - --memory
+      - "${SPARK_WORKER_MEMORY:-2g}"
+      - --work-dir
+      - /opt/spark/work-dir/worker
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_LOCAL_IP: spark-worker
+    ports:
+      - "${SPARK_WORKER_UI_PORT:-8082}:8081"
+    volumes:
+      - ./spark-apps:/opt/spark/apps:ro
+      - spark-data:/opt/spark/work-dir
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/spark-worker/8081'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks:
+      - streaming-network
+
+  spark-submit:
+    image: spark:4.2.0-scala2.13-java17-python3-ubuntu
+    container_name: streaming-spark-submit
+    hostname: spark-submit
+    profiles: ["streaming"]
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+      spark-worker:
+        condition: service_healthy
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - spark://spark-master:7077
+      - --deploy-mode
+      - client
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0
+      - --conf
+      - spark.driver.host=spark-submit
+      - --conf
+      - spark.driver.bindAddress=0.0.0.0
+      - --conf
+      - spark.jars.ivy=/opt/spark/work-dir/.ivy2
+      - --conf
+      - spark.sql.session.timeZone=UTC
+      - /opt/spark/apps/transaction_stream.py
+      - --bootstrap-servers
+      - kafka:29092
+      - --topic
+      - "${SPARK_INPUT_TOPIC:-raw-events}"
+      - --checkpoint-location
+      - file:///opt/spark/work-dir/checkpoints/transaction-window-v2
+      - --watermark
+      - "${SPARK_WATERMARK:-30 seconds}"
+      - --window-duration
+      - "${SPARK_WINDOW_DURATION:-1 minute}"
+      - --trigger-interval
+      - "${SPARK_TRIGGER_INTERVAL:-5 seconds}"
+    ports:
+      - "${SPARK_APP_UI_PORT:-4040}:4040"
+    volumes:
+      - ./spark-apps:/opt/spark/apps:ro
+      - spark-data:/opt/spark/work-dir
+    networks:
+      - streaming-network
+
+  postgres:
+    image: postgres:17.11-alpine
+    container_name: streaming-postgres
+    hostname: postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-streaming_db}
+      POSTGRES_USER: ${POSTGRES_USER:-streaming_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streaming_password}
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
+      PGTZ: ${TZ:-Asia/Ho_Chi_Minh}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./database/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-streaming_user} -d ${POSTGRES_DB:-streaming_db}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - streaming-network
+
+  pgadmin:
+    image: dpage/pgadmin4:9.18
+    container_name: streaming-pgadmin
+    hostname: pgadmin
+    restart: unless-stopped
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin_password}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - streaming-network
+
+  grafana:
+    image: grafana/grafana:13.2.1
+    container_name: streaming-grafana
+    hostname: grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin_password}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      POSTGRES_DB: ${POSTGRES_DB:-streaming_db}
+      POSTGRES_USER: ${POSTGRES_USER:-streaming_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streaming_password}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - streaming-network
+
+networks:
+  streaming-network:
+    name: streaming-network
+    driver: bridge
+
+volumes:
+  kafka-data:
+  spark-data:
+  postgres-data:
+  pgadmin-data:
+  grafana-data:

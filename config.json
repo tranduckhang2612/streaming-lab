@@ -1,0 +1,27 @@
+{
+  "generator": {
+    "topic": "auto",
+    "partitions": 3,
+    "rate": 100,
+    "duration_seconds": 60,
+    "late_ratio": 0.1,
+    "late_delay_seconds": 45,
+    "account_count": 100,
+    "merchant_count": 50,
+    "min_amount_vnd": 10000,
+    "max_amount_vnd": 5000000,
+    "seed": 42
+  },
+  "experiments": {
+    "rates": [10, 100, 500],
+    "late_ratios": [0, 0.1, 0.3],
+    "partitions": [1, 3, 6],
+    "topic_prefix": "raw-events-p",
+    "results_dir": "results",
+    "export_logs": false
+  },
+  "runtime": {
+    "bootstrap_servers": "kafka:29092",
+    "skip_build": false
+  }
+}

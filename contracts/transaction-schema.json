@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://streaming-lab.local/schemas/raw-transaction.json",
+  "title": "Raw transaction event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "transaction_id",
+    "account_id",
+    "merchant_id",
+    "merchant_category",
+    "amount_vnd",
+    "currency",
+    "event_time",
+    "produced_at",
+    "sequence",
+    "simulated_late"
+  ],
+  "properties": {
+    "transaction_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "account_id": {
+      "type": "string",
+      "pattern": "^account-[0-9]{3,}$"
+    },
+    "merchant_id": {
+      "type": "string",
+      "pattern": "^merchant-[0-9]{3,}$"
+    },
+    "merchant_category": {
+      "type": "string",
+      "enum": [
+        "grocery",
+        "restaurant",
+        "shopping",
+        "transport",
+        "utilities"
+      ]
+    },
+    "amount_vnd": {
+      "type": "integer",
+      "minimum": 1000
+    },
+    "currency": {
+      "const": "VND"
+    },
+    "event_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "produced_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "simulated_late": {
+      "type": "boolean"
+    }
+  }
+}
