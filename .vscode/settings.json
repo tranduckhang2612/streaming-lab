@@ -1,0 +1,13 @@
+{
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/spark-apps",
+    "${workspaceFolder}/producer",
+    "${workspaceFolder}/app"
+  ],
+  "python.testing.unittestArgs": [
+    "-v",
+    "-s",
+    "${workspaceFolder}/tests"
+  ],
+  "python.testing.unittestEnabled": true
+}

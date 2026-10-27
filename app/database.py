@@ -179,6 +179,7 @@ COMMIT;
             cwd=self.project_root,
             input=sql,
             text=True,
+            encoding="utf-8",
             capture_output=True,
             check=True,
         )
