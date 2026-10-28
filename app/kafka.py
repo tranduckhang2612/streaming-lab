@@ -108,6 +108,8 @@ class KafkaAdmin:
             ["docker", "compose", "exec", "-T", "kafka", *arguments],
             cwd=self.project_root,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             check=True,
         )
