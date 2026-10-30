@@ -3,6 +3,8 @@
 Pipeline transaction thời gian thực sử dụng Kafka, Spark Structured Streaming,
 PostgreSQL và Grafana.
 
+Tài liệu cho người làm dashboard: [Bàn giao Grafana](docs/GRAFANA_HANDOVER.md).
+
 ## 1. Chỉnh thông số
 
 Toàn bộ thông số thường dùng nằm trong `config.json`:

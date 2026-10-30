@@ -191,6 +191,7 @@ services:
     hostname: spark-submit
     profiles: ["streaming"]
     restart: "no"
+    stop_grace_period: 60s
     depends_on:
       kafka:
         condition: service_healthy
@@ -209,6 +210,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-streaming_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streaming_password}
     command:
+      - /bin/bash
+      - /opt/spark/apps/run_stream.sh
       - /opt/spark/bin/spark-submit
       - --master
       - spark://spark-master:7077
@@ -230,7 +233,7 @@ services:
       - --topic
       - "${SPARK_INPUT_TOPIC:-raw-events}"
       - --checkpoint-location
-      - "${SPARK_CHECKPOINT_LOCATION:-file:///opt/spark/work-dir/checkpoints/transaction-window-v2}"
+      - "${SPARK_CHECKPOINT_LOCATION:-}"
       - --watermark
       - "${SPARK_WATERMARK:-30 seconds}"
       - --window-duration

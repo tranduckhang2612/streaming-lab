@@ -1,0 +1,418 @@
+{
+  "started_at": "2026-10-30T03:41:59.306245+00:00",
+  "checks": [
+    {
+      "check": "spark_started",
+      "at": "2026-10-30T03:42:24.377743+00:00",
+      "spark_run_id": "997a0026-4e68-4fcb-b3a0-84095e5539b7",
+      "query_id": "c0f66788-80f5-41e2-b2fa-dae61c2aef6d",
+      "topic": "handover-20261030-p1",
+      "checkpoint_location": "file:///opt/spark/work-dir/checkpoints/transaction-window-v3/handover-20261030-p1",
+      "status": "running",
+      "started_at": "2026-10-30T10:42:22.355882+07:00"
+    },
+    {
+      "check": "fixture_delivered",
+      "at": "2026-10-30T03:42:26.681617+00:00",
+      "topic": "handover-20261030-p1",
+      "phase": "initial",
+      "delivered": 20,
+      "partitions": [
+        0
+      ]
+    },
+    {
+      "check": "fixture_delivered",
+      "at": "2026-10-30T03:42:28.356356+00:00",
+      "topic": "handover-20261030-p1",
+      "phase": "invalid",
+      "delivered": 5,
+      "partitions": [
+        0
+      ]
+    },
+    {
+      "check": "invalid_events_excluded",
+      "at": "2026-10-30T03:42:40.189276+00:00",
+      "topic": "handover-20261030-p1",
+      "kafka_records": 25,
+      "valid_transactions": 20,
+      "amount": 20000,
+      "last_batch": 1
+    },
+    {
+      "check": "fixture_delivered",
+      "at": "2026-10-30T03:42:42.109609+00:00",
+      "topic": "handover-20261030-p1",
+      "phase": "backlog",
+      "delivered": 10,
+      "partitions": [
+        0
+      ]
+    },
+    {
+      "check": "spark_started",
+      "at": "2026-10-30T03:43:05.191830+00:00",
+      "spark_run_id": "78695365-1fb1-4795-9459-96931899772a",
+      "query_id": "c0f66788-80f5-41e2-b2fa-dae61c2aef6d",
+      "topic": "handover-20261030-p1",
+      "checkpoint_location": "file:///opt/spark/work-dir/checkpoints/transaction-window-v3/handover-20261030-p1",
+      "status": "running",
+      "started_at": "2026-10-30T10:43:04.506339+07:00"
+    },
+    {
+      "check": "checkpoint_recovery_passed",
+      "at": "2026-10-30T03:43:21.279467+00:00",
+      "topic": "handover-20261030-p1",
+      "query_id": "c0f66788-80f5-41e2-b2fa-dae61c2aef6d",
+      "first_run_id": "997a0026-4e68-4fcb-b3a0-84095e5539b7",
+      "restarted_run_id": "78695365-1fb1-4795-9459-96931899772a",
+      "resumed_offsets": {
+        "batch_id": 3,
+        "start_offset": 25,
+        "end_offset": 35,
+        "rows_read": 10
+      },
+      "transaction_count": 30,
+      "total_amount_vnd": 30000
+    },
+    {
+      "check": "fixture_delivered",
+      "at": "2026-10-30T03:43:22.438815+00:00",
+      "topic": "handover-20261030-p1",
+      "phase": "late",
+      "delivered": 10,
+      "partitions": [
+        0
+      ]
+    },
+    {
+      "check": "watermark_passed",
+      "at": "2026-10-30T03:46:33.402103+00:00",
+      "topic": "handover-20261030-p1",
+      "late_kafka_records_excluded": 10,
+      "spark_state_rows_dropped": 1
+    },
+    {
+      "check": "spark_started",
+      "at": "2026-10-30T03:46:52.136712+00:00",
+      "spark_run_id": "a5030315-a831-4cc5-aa8e-56fbe6a4908b",
+      "query_id": "d095d484-682b-4ffe-b844-9068f521226d",
+      "topic": "handover-20261030-p3",
+      "checkpoint_location": "file:///opt/spark/work-dir/checkpoints/transaction-window-v3/handover-20261030-p3",
+      "status": "running",
+      "started_at": "2026-10-30T10:46:50.003307+07:00"
+    },
+    {
+      "check": "fixture_delivered",
+      "at": "2026-10-30T03:46:53.891552+00:00",
+      "topic": "handover-20261030-p3",
+      "phase": "initial",
+      "delivered": 40,
+      "partitions": [
+        0,
+        1,
+        2
+      ]
+    },
+    {
+      "check": "topic_isolation_passed",
+      "at": "2026-10-30T03:47:07.864694+00:00",
+      "topics": [
+        "handover-20261030-p1",
+        "handover-20261030-p3"
+      ],
+      "counts": [
+        30,
+        40
+      ],
+      "amounts": [
+        30000,
+        80000
+      ],
+      "separate_query_ids": true
+    },
+    {
+      "check": "spark_started",
+      "at": "2026-10-30T03:47:32.897835+00:00",
+      "spark_run_id": "a1cd0d0a-c068-41f0-94ac-bc8839b5233b",
+      "query_id": "c0f66788-80f5-41e2-b2fa-dae61c2aef6d",
+      "topic": "handover-20261030-p1",
+      "checkpoint_location": "file:///opt/spark/work-dir/checkpoints/transaction-window-v3/handover-20261030-p1",
+      "status": "running",
+      "started_at": "2026-10-30T10:47:31.416154+07:00"
+    },
+    {
+      "check": "topic_switch_back_passed",
+      "at": "2026-10-30T03:47:32.968900+00:00",
+      "topic": "handover-20261030-p1",
+      "query_id": "c0f66788-80f5-41e2-b2fa-dae61c2aef6d"
+    },
+    {
+      "check": "spark_started",
+      "at": "2026-10-30T03:47:57.092216+00:00",
+      "spark_run_id": "9d2a4980-91b9-4cc8-87bf-7a570563f1b6",
+      "query_id": "e11dc096-91c5-4f28-9329-00ff3d59cab1",
+      "topic": "raw-events",
+      "checkpoint_location": "file:///opt/spark/work-dir/checkpoints/transaction-window-v3/raw-events",
+      "status": "running",
+      "started_at": "2026-10-30T10:47:55.570464+07:00"
+    },
+    {
+      "check": "default_stream_restored",
+      "at": "2026-10-30T03:47:57.092628+00:00",
+      "spark_run_id": "9d2a4980-91b9-4cc8-87bf-7a570563f1b6",
+      "query_id": "e11dc096-91c5-4f28-9329-00ff3d59cab1",
+      "topic": "raw-events",
+      "checkpoint_location": "file:///opt/spark/work-dir/checkpoints/transaction-window-v3/raw-events",
+      "status": "running",
+      "started_at": "2026-10-30T10:47:55.570464+07:00"
+    },
+    {
+      "check": "graceful_shutdown_passed",
+      "at": "2026-10-30T03:57:13.741640+00:00",
+      "spark_run_id": "6c55843d-d729-43fc-bcf0-2149787a369f",
+      "status": "stopped",
+      "finished_at": "2026-10-30T10:57:13.252262+07:00"
+    },
+    {
+      "check": "spark_started",
+      "at": "2026-10-30T03:57:26.995132+00:00",
+      "spark_run_id": "6e7b7b1b-381f-4a34-91b8-2409e8e5354d",
+      "query_id": "e11dc096-91c5-4f28-9329-00ff3d59cab1",
+      "topic": "raw-events",
+      "checkpoint_location": "file:///opt/spark/work-dir/checkpoints/transaction-window-v3/raw-events",
+      "status": "running",
+      "started_at": "2026-10-30T10:57:25.604995+07:00"
+    },
+    {
+      "check": "stale_statuses_reconciled",
+      "at": "2026-10-30T03:57:27.429255+00:00",
+      "runs": [
+        {
+          "spark_run_id": "1989f9e4-a5d2-44d4-a24d-e6a83c6ff7a7",
+          "finished_at": null,
+          "reason": "stop verified by test; exact timestamp no longer in Docker event history"
+        },
+        {
+          "spark_run_id": "997a0026-4e68-4fcb-b3a0-84095e5539b7",
+          "finished_at": null,
+          "reason": "stop verified by test; exact timestamp no longer in Docker event history"
+        },
+        {
+          "spark_run_id": "78695365-1fb1-4795-9459-96931899772a",
+          "finished_at": null,
+          "reason": "stop verified by test; exact timestamp no longer in Docker event history"
+        },
+        {
+          "spark_run_id": "a5030315-a831-4cc5-aa8e-56fbe6a4908b",
+          "finished_at": null,
+          "reason": "stop verified by test; exact timestamp no longer in Docker event history"
+        },
+        {
+          "spark_run_id": "a1cd0d0a-c068-41f0-94ac-bc8839b5233b",
+          "finished_at": null,
+          "reason": "stop verified by test; exact timestamp no longer in Docker event history"
+        },
+        {
+          "spark_run_id": "9d2a4980-91b9-4cc8-87bf-7a570563f1b6",
+          "finished_at": null,
+          "reason": "stop verified by test; exact timestamp no longer in Docker event history"
+        }
+      ]
+    }
+  ],
+  "anchor": "2026-10-30T03:42:24+00:00",
+  "status": "passed",
+  "final_run": {
+    "spark_run_id": "6e7b7b1b-381f-4a34-91b8-2409e8e5354d",
+    "query_id": "e11dc096-91c5-4f28-9329-00ff3d59cab1",
+    "topic": "raw-events",
+    "checkpoint_location": "file:///opt/spark/work-dir/checkpoints/transaction-window-v3/raw-events",
+    "status": "running",
+    "started_at": "2026-10-30T10:57:25.604995+07:00"
+  },
+  "expected_failure_regressions": [
+    {
+      "spark_run_id": "3ddb0261-9d20-4031-892f-90ecdfe7120a",
+      "finished_at": "2026-10-30T10:54:49.722102+07:00"
+    }
+  ],
+  "notes": [
+    "Historical stop times without retained Docker events are NULL; corrected shutdown now records status and timestamp.",
+    "Spark state watermark drop metric is not a raw Kafka event counter."
+  ],
+  "verified_at": "2026-10-30T03:59:54.069247+00:00",
+  "current_run": {
+    "spark_run_id": "6e7b7b1b-381f-4a34-91b8-2409e8e5354d",
+    "query_id": "e11dc096-91c5-4f28-9329-00ff3d59cab1",
+    "topic": "raw-events",
+    "status": "running",
+    "partition_count": 3,
+    "batches": 3,
+    "input_rows": 200,
+    "p95_samples": 2,
+    "checkpoint_samples": 3,
+    "latest_batch": "2026-10-30T10:59:10.157+07:00"
+  },
+  "table_counts": [
+    {
+      "table_name": "transaction_window_results",
+      "rows": 91
+    },
+    {
+      "table_name": "pipeline_runs",
+      "rows": 9
+    },
+    {
+      "table_name": "pipeline_batch_metrics",
+      "rows": 20
+    },
+    {
+      "table_name": "kafka_partition_metrics",
+      "rows": 50
+    }
+  ],
+  "topic_results": [
+    {
+      "topic": "handover-20261030-p1",
+      "windows": 1,
+      "transaction_count": 30,
+      "total_amount_vnd": 30000
+    },
+    {
+      "topic": "handover-20261030-p3",
+      "windows": 1,
+      "transaction_count": 40,
+      "total_amount_vnd": 80000
+    },
+    {
+      "topic": "raw-events",
+      "windows": 89,
+      "transaction_count": 3147,
+      "total_amount_vnd": 7903803000
+    }
+  ],
+  "metrics_by_topic": [
+    {
+      "topic": "handover-20261030-p1",
+      "input_rows": 45,
+      "batches": 5,
+      "p95_samples": 3,
+      "checkpoint_samples": 5,
+      "latest_batch": "2026-10-30T10:43:25+07:00"
+    },
+    {
+      "topic": "handover-20261030-p3",
+      "input_rows": 40,
+      "batches": 2,
+      "p95_samples": 1,
+      "checkpoint_samples": 2,
+      "latest_batch": "2026-10-30T10:47:00.117+07:00"
+    },
+    {
+      "topic": "raw-events",
+      "input_rows": 3147,
+      "batches": 13,
+      "p95_samples": 9,
+      "checkpoint_samples": 13,
+      "latest_batch": "2026-10-30T10:59:10.157+07:00"
+    }
+  ],
+  "demo_experiments": [
+    {
+      "run_id": "f6209a30-802b-44cf-97da-0777901167fd",
+      "topic": "raw-events",
+      "target_rate_events_s": 20.0,
+      "target_late_ratio_percent": 0.0,
+      "seed": 2026103001,
+      "delivered": 300,
+      "failed": 0,
+      "status": "passed",
+      "started_at": "2026-10-30T10:48:40.706+07:00",
+      "finished_at": "2026-10-30T10:48:57.337+07:00"
+    },
+    {
+      "run_id": "31904c54-5fd4-43c0-8ea4-47b12607d039",
+      "topic": "raw-events",
+      "target_rate_events_s": 40.0,
+      "target_late_ratio_percent": 25.0,
+      "seed": 2026103002,
+      "delivered": 600,
+      "failed": 0,
+      "status": "passed",
+      "started_at": "2026-10-30T10:49:39.005+07:00",
+      "finished_at": "2026-10-30T10:49:55.795+07:00"
+    },
+    {
+      "run_id": "40d280bb-6140-4580-b136-e206a6b6384f",
+      "topic": "raw-events",
+      "target_rate_events_s": 20.0,
+      "target_late_ratio_percent": 0.0,
+      "seed": 2026103003,
+      "delivered": 200,
+      "failed": 0,
+      "status": "passed",
+      "started_at": "2026-10-30T10:58:46.445+07:00",
+      "finished_at": "2026-10-30T10:58:58.571+07:00"
+    }
+  ],
+  "schema": [
+    {
+      "table_name": "kafka_partition_metrics",
+      "column_name": "consumer_lag",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "kafka_partition_metrics",
+      "column_name": "end_offset",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "kafka_partition_metrics",
+      "column_name": "latest_offset",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "kafka_partition_metrics",
+      "column_name": "rows_read",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "kafka_partition_metrics",
+      "column_name": "start_offset",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "pipeline_batch_metrics",
+      "column_name": "num_input_rows",
+      "is_nullable": "YES"
+    },
+    {
+      "table_name": "transaction_window_results",
+      "column_name": "topic",
+      "is_nullable": "NO"
+    }
+  ],
+  "primary_key": "PRIMARY KEY (topic, window_start, window_end, merchant_category)",
+  "invalid_derived_partition_metrics": 0,
+  "statuses": [
+    {
+      "status": "failed",
+      "runs": 1
+    },
+    {
+      "status": "running",
+      "runs": 1
+    },
+    {
+      "status": "stopped",
+      "runs": 7
+    }
+  ],
+  "final_spark_errors": [],
+  "unit_tests": {
+    "passed": 33,
+    "spark_runtime_tests_skipped_locally": 3
+  }
+}

@@ -9,6 +9,8 @@ import signal
 import sys
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
+DEFAULT_CHECKPOINT_ROOT = "file:///opt/spark/work-dir/checkpoints/transaction-window-v3"
+
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession  # type: ignore
     from pyspark.sql.streaming.listener import StreamingQueryListener  # type: ignore
@@ -93,6 +95,18 @@ def sql_literal(value: object) -> str:
     return f"'{escaped}'"
 
 
+def _sum_if_complete(values: Sequence[int | None]) -> int | None:
+    if not values or any(value is None for value in values):
+        return None
+    return sum(value for value in values if value is not None)
+
+
+def _offset_difference(end: int | None, start: int | None) -> int | None:
+    if end is None or start is None or end < start:
+        return None
+    return end - start
+
+
 def extract_batch_metrics(
     progress: dict[str, Any],
     default_topic: str,
@@ -100,109 +114,96 @@ def extract_batch_metrics(
     spark_run_id = progress.get("runId")
     query_id = progress.get("id")
     batch_id = progress.get("batchId", 0)
-    partition_count = 0
     observed_at = progress.get("timestamp")
 
-    observed_metrics = progress.get("observedMetrics", {})
-    latency_metrics = observed_metrics.get("transaction-latency", {})
+    observed_metrics = progress.get("observedMetrics") or {}
+    latency_metrics = observed_metrics.get("transaction-latency") or {}
     latency_avg_ms = latency_metrics.get("latency_avg_ms")
     latency_p95_ms = latency_metrics.get("latency_p95_ms")
     latency_max_ms = latency_metrics.get("latency_max_ms")
-    partition_count = 0
 
-    num_input_rows = progress.get("numInputRows", 0)
+    num_input_rows = progress.get("numInputRows")
     input_rows_per_second = progress.get("inputRowsPerSecond")
     processed_rows_per_second = progress.get("processedRowsPerSecond")
 
-    duration_ms = progress.get("durationMs", {})
+    duration_ms = progress.get("durationMs") or {}
     trigger_execution_ms = duration_ms.get("triggerExecution")
     add_batch_ms = duration_ms.get("addBatch")
     get_batch_ms = duration_ms.get("getBatch")
     wal_commit_ms = duration_ms.get("walCommit")
     commit_offsets_ms = duration_ms.get("commitOffsets")
-    batch_duration_ms = duration_ms.get(
-        "triggerExecution", progress.get("batchDuration")
+    batch_duration_ms = (
+        trigger_execution_ms
+        if trigger_execution_ms is not None
+        else progress.get("batchDuration")
     )
 
-    state_operators = progress.get("stateOperators", [])
-    state_rows_total = (
-        sum(op.get("numRowsTotal", 0) for op in state_operators)
-        if state_operators
-        else None
+    reported_state_operators = progress.get("stateOperators")
+    state_operators = reported_state_operators or []
+    state_rows_total = _sum_if_complete(
+        [op.get("numRowsTotal") for op in state_operators]
     )
-    state_memory_bytes = (
-        sum(op.get("memoryUsedBytes", 0) for op in state_operators)
-        if state_operators
-        else None
+    state_memory_bytes = _sum_if_complete(
+        [op.get("memoryUsedBytes") for op in state_operators]
     )
-    rows_dropped_by_watermark = (
-        sum(op.get("numRowsDroppedByWatermark", 0) for op in state_operators)
-        if state_operators
-        else None
+    rows_dropped_by_watermark = _sum_if_complete(
+        [op.get("numRowsDroppedByWatermark") for op in state_operators]
     )
-    state_commit_ms = sum(op.get("commitTimeMs", 0) for op in state_operators)
-
-    checkpoint_commit_ms = (
-        (wal_commit_ms or 0)
-        + (commit_offsets_ms or 0)
-        + state_commit_ms
+    state_commit_ms = _sum_if_complete(
+        [op.get("commitTimeMs") for op in state_operators]
+    )
+    if reported_state_operators == []:
+        # An explicitly stateless query has no state commits to include.
+        state_commit_ms = 0
+    checkpoint_commit_ms = _sum_if_complete(
+        [wal_commit_ms, commit_offsets_ms, state_commit_ms]
     )
 
-    event_time = progress.get("eventTime", {})
+    event_time = progress.get("eventTime") or {}
     watermark_at = event_time.get("watermark")
     max_event_time = event_time.get("max")
 
-    sources = progress.get("sources", [])
+    sources = progress.get("sources") or []
     partition_rows: list[dict[str, Any]] = []
-    partition_lags: list[int] = []
+    partition_lags: list[int | None] = []
 
     topic = default_topic
     if sources:
         src = sources[0]
-        start_offsets = src.get("startOffset") or {}
-        end_offsets = src.get("endOffset") or {}
-        latest_offsets = src.get("latestOffset") or {}
-
-        topics_in_src = (
-            list(end_offsets.keys()) if isinstance(end_offsets, dict) else []
-        )
-        if topics_in_src:
+        offset_maps = [
+            offsets if isinstance(offsets, dict) else {}
+            for offsets in (
+                src.get("startOffset"), src.get("endOffset"), src.get("latestOffset")
+            )
+        ]
+        topics_in_src = sorted(set().union(*(offsets.keys() for offsets in offset_maps)))
+        if len(topics_in_src) == 1:
             topic = topics_in_src[0]
-            t_end = (
-                end_offsets.get(topic, {})
-                if isinstance(end_offsets.get(topic), dict)
+        for source_topic in topics_in_src:
+            topic_offsets = [
+                offsets[source_topic]
+                if isinstance(offsets.get(source_topic), dict)
                 else {}
-            )
-            t_start = (
-                start_offsets.get(topic, {})
-                if isinstance(start_offsets.get(topic), dict)
-                else {}
-            )
-            t_latest = (
-                latest_offsets.get(topic, {})
-                if isinstance(latest_offsets.get(topic), dict)
-                else {}
-            )
-
+                for offsets in offset_maps
+            ]
             partitions = sorted(
-                set(t_end.keys()) | set(t_start.keys()) | set(t_latest.keys()),
-                key=lambda x: int(x) if str(x).isdigit() else x,
+                set().union(*(offsets.keys() for offsets in topic_offsets)), key=int,
             )
-            partition_count = len(partitions)
             for p_str in partitions:
                 p_id = int(p_str)
-                s_off = int(t_start.get(p_str, 0))
-                e_off = int(t_end.get(p_str, s_off))
-                l_off = int(t_latest.get(p_str, e_off))
-                rows_read = max(0, e_off - s_off)
-                lag = max(0, l_off - e_off)
+                s_off, e_off, l_off = (
+                    int(offsets[p_str]) if offsets.get(p_str) is not None else None
+                    for offsets in topic_offsets
+                )
+                rows_read = _offset_difference(e_off, s_off)
+                lag = _offset_difference(l_off, e_off)
                 partition_lags.append(lag)
                 partition_rows.append(
                     {
                         "spark_run_id": spark_run_id,
                         "batch_id": batch_id,
                         "observed_at": observed_at,
-                        "topic": topic,
+                        "topic": source_topic,
                         "partition_id": p_id,
                         "start_offset": s_off,
                         "end_offset": e_off,
@@ -212,8 +213,13 @@ def extract_batch_metrics(
                     }
                 )
 
-    total_consumer_lag = sum(partition_lags) if partition_lags else None
-    max_partition_lag = max(partition_lags) if partition_lags else None
+    partition_count = len(partition_rows) or None
+    total_consumer_lag = _sum_if_complete(partition_lags)
+    max_partition_lag = (
+        max(lag for lag in partition_lags if lag is not None)
+        if total_consumer_lag is not None
+        else None
+    )
 
     batch_metric = {
         "spark_run_id": spark_run_id,
@@ -349,7 +355,7 @@ INSERT INTO streaming.pipeline_runs (
 ON CONFLICT (spark_run_id) DO UPDATE SET
     query_id = EXCLUDED.query_id,
     topic = EXCLUDED.topic,
-    partition_count = EXCLUDED.partition_count,
+    partition_count = COALESCE(EXCLUDED.partition_count, streaming.pipeline_runs.partition_count),
     checkpoint_location = EXCLUDED.checkpoint_location,
     watermark_delay_seconds = EXCLUDED.watermark_delay_seconds,
     window_duration_seconds = EXCLUDED.window_duration_seconds,
@@ -381,6 +387,7 @@ WHERE spark_run_id = {sql_literal(spark_run_id)}::UUID;
         for r in rows:
             values_list.append(
                 f"("
+                f"{sql_literal(r['topic'])}, "
                 f"{sql_literal(r['window_start'])}, "
                 f"{sql_literal(r['window_end'])}, "
                 f"{sql_literal(r['merchant_category'])}, "
@@ -398,6 +405,7 @@ WHERE spark_run_id = {sql_literal(spark_run_id)}::UUID;
         values_sql = ",\n".join(values_list)
         sql = f"""
 INSERT INTO streaming.transaction_window_results (
+    topic,
     window_start,
     window_end,
     merchant_category,
@@ -411,7 +419,7 @@ INSERT INTO streaming.transaction_window_results (
     updated_at
 ) VALUES
 {values_sql}
-ON CONFLICT (window_start, window_end, merchant_category) DO UPDATE SET
+ON CONFLICT (topic, window_start, window_end, merchant_category) DO UPDATE SET
     transaction_count = EXCLUDED.transaction_count,
     total_amount_vnd = EXCLUDED.total_amount_vnd,
     average_amount_vnd = EXCLUDED.average_amount_vnd,
@@ -446,7 +454,7 @@ INSERT INTO streaming.pipeline_runs (
 ) ON CONFLICT (spark_run_id) DO UPDATE SET
     query_id = EXCLUDED.query_id,
     topic = EXCLUDED.topic,
-    partition_count = EXCLUDED.partition_count;
+    partition_count = COALESCE(EXCLUDED.partition_count, streaming.pipeline_runs.partition_count);
 """
 
         sql_batch = f"""
@@ -501,6 +509,9 @@ ON CONFLICT (spark_run_id, batch_id) DO UPDATE SET
     state_rows_total = EXCLUDED.state_rows_total,
     state_memory_bytes = EXCLUDED.state_memory_bytes,
     rows_dropped_by_watermark = EXCLUDED.rows_dropped_by_watermark,
+    latency_avg_ms = EXCLUDED.latency_avg_ms,
+    latency_p95_ms = EXCLUDED.latency_p95_ms,
+    latency_max_ms = EXCLUDED.latency_max_ms,
     total_consumer_lag = EXCLUDED.total_consumer_lag,
     max_partition_lag = EXCLUDED.max_partition_lag,
     progress_json = EXCLUDED.progress_json;
@@ -584,9 +595,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--topic", default="raw-events")
     parser.add_argument(
         "--checkpoint-location",
-        default=os.getenv(
-            "SPARK_CHECKPOINT_LOCATION",
-            "file:///opt/spark/work-dir/checkpoints/transaction-window-v2",
+        default=os.getenv("SPARK_CHECKPOINT_LOCATION"),
+        help=(
+            "Checkpoint path override. Defaults to "
+            f"{DEFAULT_CHECKPOINT_ROOT}/<topic>."
         ),
     )
     parser.add_argument("--watermark", default="30 seconds")
@@ -621,6 +633,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    args = build_parser().parse_args(argv)
+    if not args.checkpoint_location:
+        args.checkpoint_location = f"{DEFAULT_CHECKPOINT_ROOT}/{args.topic}"
+    return args
+
+
 def read_transactions(
     spark: SparkSession,
     bootstrap_servers: str,
@@ -645,9 +664,16 @@ def parse_transactions(raw: DataFrame, watermark: str) -> DataFrame:
         F.col("offset"),
         F.col("timestamp").alias("kafka_timestamp"),
     )
+    parse_schema = StructType(
+        [*TRANSACTION_SCHEMA.fields, StructField("_corrupt_record", StringType())]
+    )
     parsed = decoded.withColumn(
         "transaction",
-        F.from_json(F.col("raw_value"), TRANSACTION_SCHEMA),
+        F.from_json(
+            F.col("raw_value"),
+            parse_schema,
+            {"mode": "PERMISSIVE", "columnNameOfCorruptRecord": "_corrupt_record"},
+        ),
     ).select(
         "kafka_key",
         "raw_value",
@@ -658,21 +684,28 @@ def parse_transactions(raw: DataFrame, watermark: str) -> DataFrame:
         "transaction.*",
     )
 
-    required_fields_present = (
-        F.col("transaction_id").isNotNull()
-        & F.col("account_id").isNotNull()
-        & F.col("amount_vnd").isNotNull()
-        & F.col("event_time").isNotNull()
-        & F.col("produced_at").isNotNull()
-    )
+    required_fields_present = F.lit(True)
+    for field in TRANSACTION_SCHEMA.fields:
+        value = F.col(field.name)
+        present = value.isNotNull()
+        if isinstance(field.dataType, StringType):
+            present = present & (F.length(F.trim(value)) > 0)
+        required_fields_present = required_fields_present & present
 
     return (
         parsed.withColumn(
             "validation_error",
-            F.when(~required_fields_present, F.lit("invalid_json_or_missing_field"))
-            .when(F.col("kafka_key") != F.col("account_id"), F.lit("key_mismatch"))
+            F.when(
+                F.col("_corrupt_record").isNotNull() | ~required_fields_present,
+                F.lit("invalid_json_or_missing_field"),
+            )
+            .when(
+                ~F.col("kafka_key").eqNullSafe(F.col("account_id")),
+                F.lit("key_mismatch"),
+            )
             .when(F.col("currency") != F.lit("VND"), F.lit("unsupported_currency")),
         )
+        .drop("_corrupt_record")
         .withColumn("ingested_at", F.current_timestamp())
         .withColumn(
             "event_lateness_ms",
@@ -690,10 +723,11 @@ def aggregate_transactions(
     transactions: DataFrame,
     window_duration: str,
 ) -> DataFrame:
-    """Aggregate valid transactions by event-time window and category."""
+    """Aggregate valid transactions by Kafka topic, event-time window and category."""
     valid_transactions = transactions.filter(F.col("validation_error").isNull())
 
     aggregates = valid_transactions.groupBy(
+        F.col("topic"),
         F.window(F.col("event_time"), window_duration).alias("event_window"),
         F.col("merchant_category"),
     ).agg(
@@ -711,6 +745,7 @@ def aggregate_transactions(
     )
 
     return aggregates.select(
+        "topic",
         F.col("event_window.start").alias("window_start"),
         F.col("event_window.end").alias("window_end"),
         "merchant_category",
@@ -724,8 +759,31 @@ def aggregate_transactions(
     )
 
 
+def wait_for_query(query: Any) -> None:
+    stop_requested = False
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        nonlocal stop_requested
+        # Py4J calls from a signal handler can interrupt another Py4J call.
+        stop_requested = True
+
+    previous_handlers = {
+        signum: signal.signal(signum, request_stop)
+        for signum in (signal.SIGINT, signal.SIGTERM)
+    }
+    try:
+        while not query.awaitTermination(timeout=1):
+            if stop_requested:
+                print("\nStop signal received. Stopping streaming query...", flush=True)
+                query.stop()
+                return
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
     spark = (
         SparkSession.builder.appName("transaction-window-stream")
         .config("spark.sql.session.timeZone", "UTC")
@@ -771,7 +829,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 flush=True,
             )
             db_writer.save_window_results(rows)
-            batch_df.show(50, truncate=False)
 
     query = (
         window_results.writeStream
@@ -812,13 +869,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     status = "stopped"
     try:
-        def request_stop(_signum: int, _frame: object) -> None:
-            print("\nStop signal received. Stopping streaming query...", flush=True)
-            query.stop()
-
-        signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGTERM, request_stop)
-        query.awaitTermination()
+        wait_for_query(query)
     except Exception as exc:
         print(
             f"Streaming query terminated with error: {exc}",

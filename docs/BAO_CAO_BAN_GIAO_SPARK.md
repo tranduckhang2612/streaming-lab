@@ -17,6 +17,14 @@ Xây dựng và vận hành pipeline xử lý luồng dữ liệu giao dịch b�
 6. Đo lường và ghi nhận runtime metrics (batch metrics, partition lag, end-to-end latency) vào PostgreSQL qua `StreamingQueryListener` và Spark `.observe()`.
 7. Kiểm chứng độ tin cậy của checkpoint khi dừng và tái khởi động ứng dụng streaming.
 
+Trước khi tổng hợp, Spark kiểm tra đủ 10 trường bắt buộc và loại chuỗi rỗng
+hoặc chỉ có khoảng trắng. JSON lỗi, trường không parse được theo kiểu dữ liệu
+đã khai báo, trường thiếu hoặc `null` được gắn
+`validation_error = invalid_json_or_missing_field`. Kafka key thiếu hoặc
+không khớp `account_id` được gắn `key_mismatch`; currency khác `VND` được gắn
+`unsupported_currency`. Các event này bị loại khỏi tổng hợp window, không ghi
+vào bảng kết quả. Boolean `false` vẫn là giá trị hợp lệ của `simulated_late`.
+
 ---
 
 ## 2. Kiến trúc & Các bảng dữ liệu bàn giao
@@ -25,7 +33,7 @@ Toàn bộ dữ liệu được ghi nhận vào PostgreSQL (`streaming_db`):
 
 | Tên bảng | Mục đích bàn giao | Khóa chính (PK) |
 |---|---|---|
-| `streaming.transaction_window_results` | Kết quả thống kê nghiệp vụ theo từng window và category | `(window_start, window_end, merchant_category)` |
+| `streaming.transaction_window_results` | Kết quả thống kê nghiệp vụ theo từng topic, window và category | `(topic, window_start, window_end, merchant_category)` |
 | `streaming.pipeline_runs` | Thông tin cấu hình và định danh mỗi lần Spark khởi chạy | `spark_run_id` |
 | `streaming.pipeline_batch_metrics` | Throughput, latency (avg, p95, max), watermark, state memory, commit time theo batch | `(spark_run_id, batch_id)` |
 | `streaming.kafka_partition_metrics` | Start/End offset, latest offset, số row đọc và consumer lag theo từng partition | `(spark_run_id, batch_id, topic, partition_id)` |
@@ -33,6 +41,9 @@ Toàn bộ dữ liệu được ghi nhận vào PostgreSQL (`streaming_db`):
 ---
 
 ## 3. Bằng chứng nghiệm thu kỹ thuật (Evidence)
+
+Số liệu dưới đây được ghi nhận trước khi bổ sung `topic` vào khóa kết quả.
+Schema và hướng dẫn chạy hiện tại được cập nhật ở mục 2 và mục 4.
 
 ### 3.1. Phục hồi trạng thái qua Checkpoint (Idempotent Restart)
 
@@ -129,17 +140,55 @@ ORDER BY observed_at DESC LIMIT 5;
 
 ## 4. Hướng dẫn vận hành cho các thành viên
 
+Kết quả kiểm chứng toàn luồng ngày 30/10/2026 và SQL cho dashboard nằm trong
+[tài liệu bàn giao Grafana](GRAFANA_HANDOVER.md).
+
 ### 4.1. Khởi động pipeline qua Docker Compose
-```powershell
+```bash
 # 1. Khởi động các hạ tầng cơ sở
 docker compose up -d postgres kafka kafka-init spark-master spark-worker
 
-# 2. Khởi động Spark streaming submit
+# 2. Dừng Spark và cập nhật schema cho database hiện có
+docker compose --profile streaming stop spark-submit
+docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < database/postgres/init/streaming_schema.sql
+docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < database/postgres/migrations/001_window_results_topic.sql
+docker compose exec -T postgres sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < database/postgres/migrations/002_nullable_pipeline_metrics.sql
+
+# 3. Khởi động Spark streaming submit
 docker compose --profile streaming up -d spark-submit
 
-# 3. Theo dõi log streaming
+# 4. Theo dõi log streaming
 docker compose logs -f spark-submit
 ```
+
+Database mới đã có khóa `(topic, window_start, window_end, merchant_category)`
+trong schema khởi tạo. Migration cũng có thể chạy lại an toàn trên schema mới.
+Các dòng cũ không có thông tin topic được giữ với nhãn `<legacy-unknown>`;
+lọc chúng khỏi thống kê theo topic thực tế. Dữ liệu đã bị ghi đè trước đây
+không thể khôi phục chỉ bằng migration.
+
+Metrics không có trong Spark progress được lưu `NULL`; giá trị `0` do Spark
+báo cáo vẫn được giữ. `rows_read` chỉ được tính khi có cả start/end offset,
+`consumer_lag` chỉ được tính khi có cả end/latest offset và hiệu không âm.
+Tổng/max lag chỉ có giá trị khi mọi partition được báo cáo đều có lag;
+thời gian checkpoint chỉ được tính khi đủ các thành phần áp dụng. Query báo
+`stateOperators: []` không có phần state commit; thiếu mục này là chưa biết.
+Không xác định được partition nào thì `partition_count` là `NULL`.
+Migration 002 cho phép các metric thiếu được lưu `NULL`, không sửa lại các số
+liệu lịch sử đã ghi trước bản sửa này. Dashboard nên hiển thị dữ liệu thiếu
+thay vì dùng `COALESCE(..., 0)` để biểu diễn thành số đo bằng 0.
+
+Checkpoint mặc định hiện được tách theo input topic:
+`file:///opt/spark/work-dir/checkpoints/transaction-window-v3/<topic>`.
+Ví dụ `raw-events-p1` và `raw-events-p3` dùng hai thư mục riêng; khởi động lại
+cùng topic sẽ dùng lại checkpoint của topic đó. Không đặt một giá trị
+`SPARK_CHECKPOINT_LOCATION` chung khi chuyển qua lại giữa các topic.
+
+Việc thêm `topic` vào khóa nhóm Spark thay đổi schema của state. Checkpoint
+trước thay đổi này (bao gồm `transaction-window-v2/<topic>`) không tương thích;
+dùng đường dẫn mặc định `v3` hoặc một thư mục mới khi đặt
+`SPARK_CHECKPOINT_LOCATION` / `--checkpoint-location`. Spark tạo query mới
+và đọc lại từ `earliest` đối với dữ liệu còn được Kafka lưu giữ.
 
 ### 4.2. Khởi động sinh giao dịch thử nghiệm
 ```powershell

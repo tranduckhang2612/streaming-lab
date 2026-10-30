@@ -3,6 +3,7 @@ CREATE SCHEMA IF NOT EXISTS streaming;
 -- Kết quả xử lý và metric của Spark Structured Streaming
 
 CREATE TABLE IF NOT EXISTS streaming.transaction_window_results (
+    topic TEXT NOT NULL,
     window_start TIMESTAMPTZ NOT NULL,
     window_end TIMESTAMPTZ NOT NULL,
     merchant_category TEXT NOT NULL,
@@ -14,7 +15,7 @@ CREATE TABLE IF NOT EXISTS streaming.transaction_window_results (
     simulated_late_count BIGINT NOT NULL,
     average_event_lateness_ms NUMERIC(18, 2) NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (window_start, window_end, merchant_category),
+    PRIMARY KEY (topic, window_start, window_end, merchant_category),
     CHECK (window_end > window_start)
 );
 
@@ -42,7 +43,7 @@ CREATE TABLE IF NOT EXISTS streaming.pipeline_batch_metrics (
     batch_id BIGINT NOT NULL,
     observed_at TIMESTAMPTZ NOT NULL,
     topic TEXT NOT NULL,
-    num_input_rows BIGINT NOT NULL,
+    num_input_rows BIGINT,
     input_rows_per_second NUMERIC(18, 3),
     processed_rows_per_second NUMERIC(18, 3),
     batch_duration_ms BIGINT,
@@ -72,11 +73,11 @@ CREATE TABLE IF NOT EXISTS streaming.kafka_partition_metrics (
     observed_at TIMESTAMPTZ NOT NULL,
     topic TEXT NOT NULL,
     partition_id INTEGER NOT NULL,
-    start_offset BIGINT NOT NULL,
-    end_offset BIGINT NOT NULL,
-    latest_offset BIGINT NOT NULL,
-    rows_read BIGINT NOT NULL,
-    consumer_lag BIGINT NOT NULL,
+    start_offset BIGINT,
+    end_offset BIGINT,
+    latest_offset BIGINT,
+    rows_read BIGINT,
+    consumer_lag BIGINT,
     PRIMARY KEY (spark_run_id, batch_id, topic, partition_id),
     FOREIGN KEY (spark_run_id, batch_id)
         REFERENCES streaming.pipeline_batch_metrics(spark_run_id, batch_id)
