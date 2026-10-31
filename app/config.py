@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -106,10 +107,15 @@ class ExperimentConfig:
 class RuntimeConfig:
     bootstrap_servers: str = "kafka:29092"
     skip_build: bool = False
+    spark_startup_timeout_seconds: float = 180
+    spark_drain_timeout_seconds: float = 120
 
     def __post_init__(self) -> None:
         if not self.bootstrap_servers:
             raise ConfigError("runtime.bootstrap_servers cannot be empty")
+        for name in ("spark_startup_timeout_seconds", "spark_drain_timeout_seconds"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ConfigError(f"runtime.{name} must be greater than zero")
 
 
 @dataclass(frozen=True)

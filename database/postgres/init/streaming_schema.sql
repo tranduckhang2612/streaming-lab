@@ -1,3 +1,8 @@
+-- Tạo mới hoặc nâng cấp database hiện có bằng một file duy nhất.
+-- Dừng các Spark writer trước khi áp dụng lên database đang sử dụng.
+-- Có thể chạy lại; dữ liệu và khóa chính đã đúng được giữ nguyên.
+BEGIN;
+
 CREATE SCHEMA IF NOT EXISTS streaming;
 
 -- Kết quả xử lý và metric của Spark Structured Streaming
@@ -36,6 +41,25 @@ CREATE TABLE IF NOT EXISTS streaming.pipeline_runs (
     CHECK (partition_count IS NULL OR partition_count > 0),
     CHECK (finished_at IS NULL OR finished_at >= started_at)
 );
+
+-- Also upgrade existing tables when this initialization script is reapplied.
+ALTER TABLE streaming.pipeline_runs
+    ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS superseded_by_run_id UUID;
+
+-- Keep the recorded terminal outcome separate from inferred driver liveness.
+CREATE OR REPLACE VIEW streaming.pipeline_run_status AS
+SELECT r.*,
+    CASE
+        WHEN r.status <> 'running' THEN r.status
+        WHEN r.superseded_by_run_id IS NOT NULL THEN 'superseded'
+        WHEN r.last_heartbeat_at IS NULL THEN 'unknown'
+        WHEN r.last_heartbeat_at < CURRENT_TIMESTAMP - INTERVAL '30 seconds'
+            THEN 'unresponsive'
+        ELSE 'running'
+    END AS effective_status,
+    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - r.last_heartbeat_at)) AS heartbeat_age_seconds
+FROM streaming.pipeline_runs r;
 
 CREATE TABLE IF NOT EXISTS streaming.pipeline_batch_metrics (
     spark_run_id UUID NOT NULL REFERENCES streaming.pipeline_runs(spark_run_id)
@@ -147,3 +171,58 @@ CREATE TABLE IF NOT EXISTS streaming.experiment_logs (
     log_text TEXT NOT NULL,
     stored_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Nâng cấp bảng kết quả cũ chưa tách theo topic.
+-- Không suy đoán topic của dữ liệu lịch sử từ cấu hình hiện tại.
+ALTER TABLE streaming.transaction_window_results
+    ADD COLUMN IF NOT EXISTS topic TEXT;
+
+UPDATE streaming.transaction_window_results
+SET topic = '<legacy-unknown>'
+WHERE topic IS NULL;
+
+ALTER TABLE streaming.transaction_window_results
+    ALTER COLUMN topic SET NOT NULL;
+
+DO $$
+DECLARE
+    primary_key_name TEXT;
+    primary_key_columns TEXT[];
+BEGIN
+    SELECT c.conname, ARRAY(
+        SELECT a.attname::TEXT
+        FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, position)
+        JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+        ORDER BY k.position
+    ) INTO primary_key_name, primary_key_columns
+    FROM pg_constraint c
+    WHERE c.conrelid = 'streaming.transaction_window_results'::REGCLASS
+      AND c.contype = 'p';
+
+    IF primary_key_columns IS DISTINCT FROM
+        ARRAY['topic', 'window_start', 'window_end', 'merchant_category']::TEXT[] THEN
+        IF primary_key_name IS NOT NULL THEN
+            EXECUTE format(
+                'ALTER TABLE streaming.transaction_window_results DROP CONSTRAINT %I',
+                primary_key_name
+            );
+        END IF;
+        ALTER TABLE streaming.transaction_window_results
+            ADD CONSTRAINT transaction_window_results_pkey
+            PRIMARY KEY (topic, window_start, window_end, merchant_category);
+    END IF;
+END;
+$$;
+
+-- Metric thiếu là chưa biết, kể cả trên bảng được tạo bởi phiên bản cũ.
+ALTER TABLE streaming.pipeline_batch_metrics
+    ALTER COLUMN num_input_rows DROP NOT NULL;
+
+ALTER TABLE streaming.kafka_partition_metrics
+    ALTER COLUMN start_offset DROP NOT NULL,
+    ALTER COLUMN end_offset DROP NOT NULL,
+    ALTER COLUMN latest_offset DROP NOT NULL,
+    ALTER COLUMN rows_read DROP NOT NULL,
+    ALTER COLUMN consumer_lag DROP NOT NULL;
+
+COMMIT;

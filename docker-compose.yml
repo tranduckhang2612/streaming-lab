@@ -205,7 +205,8 @@ services:
         condition: service_healthy
     environment:
       POSTGRES_HOST: postgres
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      # Container clients use PostgreSQL's internal port, independent of host publishing.
+      POSTGRES_PORT: "5432"
       POSTGRES_DB: ${POSTGRES_DB:-streaming_db}
       POSTGRES_USER: ${POSTGRES_USER:-streaming_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streaming_password}
@@ -220,7 +221,7 @@ services:
       - --packages
       - org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0,org.postgresql:postgresql:42.7.3
       - --conf
-      - spark.driver.host=spark-submit
+      - spark.driver.host=${SPARK_DRIVER_HOST:-spark-submit}
       - --conf
       - spark.driver.bindAddress=0.0.0.0
       - --conf
@@ -236,6 +237,8 @@ services:
       - "${SPARK_CHECKPOINT_LOCATION:-}"
       - --watermark
       - "${SPARK_WATERMARK:-30 seconds}"
+      - --max-future-skew-seconds
+      - "${SPARK_MAX_FUTURE_SKEW_SECONDS:-30}"
       - --window-duration
       - "${SPARK_WINDOW_DURATION:-1 minute}"
       - --trigger-interval
@@ -243,7 +246,7 @@ services:
       - --postgres-host
       - postgres
       - --postgres-port
-      - "${POSTGRES_PORT:-5432}"
+      - "5432"
       - --postgres-db
       - "${POSTGRES_DB:-streaming_db}"
       - --postgres-user
@@ -264,6 +267,7 @@ services:
     hostname: postgres
     restart: unless-stopped
     ports:
+      # POSTGRES_PORT changes the host endpoint only; the container listens on 5432.
       - "${POSTGRES_PORT:-5432}:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-streaming_db}

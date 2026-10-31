@@ -159,7 +159,35 @@ COMMIT;
             f"WHERE run_id = {sql_literal(run_id)}::UUID;"
         )
 
-    def _execute(self, sql: str) -> str:
+    def pipeline_progress(self, checkpoint: str, topic: str) -> dict[str, object] | None:
+        """Read only progress committed by this scenario's Spark query."""
+        output = self._execute(f"""
+SELECT json_build_object(
+    'spark_run_id', r.spark_run_id,
+    'query_id', r.query_id,
+    'effective_status', r.effective_status,
+    -- Idle progress may advertise the next batch ID before it executes.
+    'batch_id', COALESCE((SELECT MAX(batch_id) FROM streaming.pipeline_batch_metrics
+                         WHERE spark_run_id = r.spark_run_id AND add_batch_ms IS NOT NULL), -1),
+    'end_offsets', COALESCE((
+        SELECT json_object_agg(p.partition_id, p.end_offset)
+        FROM (
+            SELECT partition_id, MAX(end_offset) AS end_offset
+            FROM streaming.kafka_partition_metrics
+            WHERE spark_run_id = r.spark_run_id
+              AND topic = {sql_literal(topic)} AND end_offset IS NOT NULL
+            GROUP BY partition_id
+        ) p
+    ), '{{}}'::JSON)
+)
+FROM streaming.pipeline_run_status r
+WHERE checkpoint_location = {sql_literal(checkpoint)} AND topic = {sql_literal(topic)}
+ORDER BY started_at DESC
+LIMIT 1;
+""", timeout_seconds=10)
+        return json.loads(output) if output else None
+
+    def _execute(self, sql: str, timeout_seconds: float | None = None) -> str:
         completed = subprocess.run(
             [
                 "docker",
@@ -169,6 +197,7 @@ COMMIT;
                 "postgres",
                 "psql",
                 "-X",
+                "-qAt",
                 "-v",
                 "ON_ERROR_STOP=1",
                 "-U",
@@ -182,5 +211,6 @@ COMMIT;
             encoding="utf-8",
             capture_output=True,
             check=True,
+            timeout=timeout_seconds,
         )
         return completed.stdout.strip()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -12,6 +13,7 @@ from .config import AppConfig, GeneratorConfig, PROJECT_ROOT
 from .database import ExperimentStore
 from .generator import execute, prepare_environment, timestamp_id, utc_timestamp
 from .kafka import KafkaAdmin, balance_cv, partition_deltas
+from .spark import SparkPipeline, SparkPipelineError
 
 
 RESULT_FIELDS = (
@@ -21,6 +23,8 @@ RESULT_FIELDS = (
     "active_partitions",
     "partition_event_counts",
     "offset_event_count",
+    "kafka_start_offsets",
+    "kafka_end_offsets",
     "offsets_match_delivery",
     "all_partitions_active",
     "partition_balance_cv_percent",
@@ -43,6 +47,15 @@ RESULT_FIELDS = (
     "rate_achievement_percent",
     "delivery_success_percent",
     "status",
+    "generator_finished_at_utc",
+    "spark_run_id",
+    "spark_query_id",
+    "spark_checkpoint_location",
+    "spark_baseline_batch_id",
+    "spark_final_batch_id",
+    "spark_processed_offsets",
+    "spark_status",
+    "spark_error",
     "log_file",
 )
 
@@ -138,12 +151,14 @@ class ExperimentRunner:
         self.project_root = project_root
         self.kafka = KafkaAdmin(project_root)
         self.store = ExperimentStore(project_root)
+        self.spark = SparkPipeline(self.store, config.runtime, project_root)
 
     def run(self, plan: ExperimentPlan) -> RunReport:
         prepare_environment(self.config.runtime, self.project_root)
         self.store.prepare()
         self._ensure_topics(plan.scenarios)
 
+        managed_spark = plan.experiment_type == "partition"
         run_stamp = timestamp_id()
         run_id = self.store.create_run(
             experiment_type=plan.experiment_type,
@@ -151,6 +166,9 @@ class ExperimentRunner:
             started_at=utc_timestamp(),
             configuration={
                 "experiment_type": plan.experiment_type,
+                "managed_spark": managed_spark,
+                "spark_startup_timeout_seconds": self.config.runtime.spark_startup_timeout_seconds,
+                "spark_drain_timeout_seconds": self.config.runtime.spark_drain_timeout_seconds,
                 "scenarios": [
                     scenario.generator.as_dict() for scenario in plan.scenarios
                 ],
@@ -159,16 +177,19 @@ class ExperimentRunner:
 
         results: list[dict[str, object]] = []
         try:
-            for sequence, scenario in enumerate(plan.scenarios, start=1):
-                result, output = self._run_scenario(scenario, run_stamp)
-                results.append(result)
-                self.store.save_scenario(
-                    run_id=run_id,
-                    sequence_number=sequence,
-                    result=result,
-                    log_text=output,
-                )
-        except Exception:
+            with self.spark.session() if managed_spark else nullcontext():
+                for sequence, scenario in enumerate(plan.scenarios, start=1):
+                    result, output = self._run_scenario(
+                        scenario, run_stamp, run_id if managed_spark else None
+                    )
+                    results.append(result)
+                    self.store.save_scenario(
+                        run_id=run_id,
+                        sequence_number=sequence,
+                        result=result,
+                        log_text=output,
+                    )
+        except BaseException:
             self.store.finish_run(run_id, "failed", utc_timestamp())
             raise
 
@@ -196,6 +217,7 @@ class ExperimentRunner:
         self,
         scenario: Scenario,
         run_stamp: str,
+        experiment_run_id: str | None = None,
     ) -> tuple[dict[str, object], str]:
         generator = scenario.generator
         topic = generator.resolved_topic
@@ -206,6 +228,47 @@ class ExperimentRunner:
             flush=True,
         )
         before = self.kafka.offsets(topic)
+        context = (self.spark.scenario(topic, experiment_run_id)
+                   if experiment_run_id else nullcontext(None))
+        if experiment_run_id:
+            self._validate_offsets(before, generator.partitions)
+        with context as pipeline:
+            ready = None
+            if pipeline:
+                print(f"Waiting for Spark to read {topic} before producing...", flush=True)
+                ready = self.spark.wait_for_offsets(pipeline, before, startup=True)
+            result, output = self._produce_scenario(scenario, run_stamp, before)
+            if pipeline:
+                result.update(
+                    spark_run_id=ready["spark_run_id"],
+                    spark_query_id=ready["query_id"],
+                    spark_checkpoint_location=pipeline.checkpoint,
+                    spark_baseline_batch_id=ready["batch_id"],
+                )
+                try:
+                    target = result["kafka_end_offsets"]
+                    self._validate_offsets(target, generator.partitions)
+                    print(f"Waiting for Spark to finish {topic}: offsets={target}...", flush=True)
+                    processed = self.spark.wait_for_offsets(pipeline, target)
+                    result["spark_processed_offsets"] = processed["end_offsets"]
+                    result["spark_final_batch_id"] = processed["batch_id"]
+                    result["spark_status"] = "passed"
+                except SparkPipelineError as exc:
+                    result.update(spark_status="failed", spark_error=str(exc), status="failed")
+                    print(f"Spark scenario failed: {exc}", flush=True)
+                result["finished_at_utc"] = utc_timestamp()
+            return result, output
+
+    @staticmethod
+    def _validate_offsets(offsets: dict[int, int], partitions: int) -> None:
+        if set(offsets) != set(range(partitions)) or any(v < 0 for v in offsets.values()):
+            raise SparkPipelineError("Kafka did not report offsets for every expected partition.")
+
+    def _produce_scenario(
+        self, scenario: Scenario, run_stamp: str, before: dict[int, int],
+    ) -> tuple[dict[str, object], str]:
+        generator = scenario.generator
+        topic = generator.resolved_topic
         started_at = utc_timestamp()
         log_path = self._log_path(run_stamp, scenario.name)
         execution = execute(
@@ -229,10 +292,13 @@ class ExperimentRunner:
             "active_partitions": active,
             "partition_event_counts": counts,
             "offset_event_count": offset_count,
+            "kafka_start_offsets": before,
+            "kafka_end_offsets": after,
             "all_partitions_active": all_active,
             "partition_balance_cv_percent": balance_cv(counts),
             "started_at_utc": started_at,
             "finished_at_utc": finished_at,
+            "generator_finished_at_utc": finished_at,
             "target_rate_events_s": generator.rate,
             "duration_seconds": generator.duration_seconds,
             "expected_events": round(generator.rate * generator.duration_seconds),

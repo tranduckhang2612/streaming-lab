@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from app.config import AppConfig, ConfigError, GeneratorConfig
+from app.config import AppConfig, ConfigError, GeneratorConfig, RuntimeConfig
 
 
 class ConfigTests(unittest.TestCase):
@@ -33,6 +33,12 @@ class ConfigTests(unittest.TestCase):
     def test_rejects_invalid_late_ratio(self) -> None:
         with self.assertRaises(ConfigError):
             GeneratorConfig(late_ratio=10)
+
+    def test_spark_timeouts_must_be_positive_and_finite(self) -> None:
+        for name in ("spark_startup_timeout_seconds", "spark_drain_timeout_seconds"):
+            for value in (0, -1, float("nan"), float("inf")):
+                with self.subTest(name=name, value=value), self.assertRaises(ConfigError):
+                    RuntimeConfig(**{name: value})
 
 
 if __name__ == "__main__":

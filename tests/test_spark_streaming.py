@@ -1,10 +1,12 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import signal
 import sqlite3
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -38,6 +40,87 @@ class StreamingQueryLifecycleTests(unittest.TestCase):
         transaction_stream.wait_for_query(query)
         stop.assert_called_once_with()
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+
+    def test_idle_query_heartbeats_recover_after_database_failure(self) -> None:
+        clock = [0]
+        calls = []
+
+        def awaiting(timeout):
+            clock[0] += timeout
+            return clock[0] >= 15
+
+        def heartbeat():
+            calls.append(clock[0])
+            if len(calls) == 1:
+                raise OSError("database unavailable")
+
+        query = SimpleNamespace(awaitTermination=awaiting, stop=Mock())
+        errors = io.StringIO()
+        with patch.object(transaction_stream.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch("sys.stderr", errors):
+            transaction_stream.wait_for_query(query, heartbeat=heartbeat)
+        self.assertEqual(calls, [5, 10])
+        self.assertIn("database unavailable", errors.getvalue())
+        query.stop.assert_not_called()
+
+    def test_stop_signal_takes_priority_over_due_heartbeat(self) -> None:
+        heartbeat = Mock()
+
+        def awaiting(timeout):
+            signal.raise_signal(signal.SIGTERM)
+            return False
+
+        query = SimpleNamespace(awaitTermination=awaiting, stop=Mock())
+        with patch.object(transaction_stream.time, "monotonic", side_effect=[0, 5]):
+            transaction_stream.wait_for_query(query, heartbeat=heartbeat)
+        heartbeat.assert_not_called()
+        query.stop.assert_called_once_with()
+
+    def test_query_failure_restores_signal_handlers(self) -> None:
+        query = SimpleNamespace(awaitTermination=Mock(side_effect=RuntimeError("failed")))
+        handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            transaction_stream.wait_for_query(query, heartbeat=Mock())
+        for signum, handler in handlers.items():
+            self.assertEqual(signal.getsignal(signum), handler)
+
+
+class PipelineLifecycleWriterTests(unittest.TestCase):
+    def test_terminal_write_retries_a_temporary_outage(self) -> None:
+        writer = transaction_stream.PostgresWriter(spark=None)
+        with patch.object(writer, "execute", side_effect=[OSError("offline"), None]) as execute, \
+                patch.object(transaction_stream.time, "sleep") as sleep:
+            writer.record_pipeline_finish("b213c031-371c-4f95-8b8d-e08ab4bd953f")
+        self.assertEqual(execute.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_terminal_write_gives_up_after_three_attempts(self) -> None:
+        writer = transaction_stream.PostgresWriter(spark=None)
+        with patch.object(writer, "execute", side_effect=OSError("offline")) as execute, \
+                patch.object(transaction_stream.time, "sleep") as sleep:
+            with self.assertRaisesRegex(OSError, "offline"):
+                writer.record_pipeline_finish("b213c031-371c-4f95-8b8d-e08ab4bd953f")
+        self.assertEqual(execute.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_lifecycle_timeout_covers_connect_and_query_without_reconnecting(self) -> None:
+        spark = Mock()
+        writer = transaction_stream.PostgresWriter(spark=spark)
+        spark._jvm.org.postgresql.Driver.return_value.connect.side_effect = OSError("offline")
+        with self.assertRaisesRegex(OSError, "offline"):
+            writer.record_pipeline_heartbeat("b213c031-371c-4f95-8b8d-e08ab4bd953f")
+        spark._jvm.org.postgresql.Driver.return_value.connect.assert_called_once()
+        spark._jvm.java.sql.DriverManager.getConnection.assert_not_called()
+        props = spark._jvm.java.util.Properties.return_value
+        for name in ("loginTimeout", "connectTimeout", "socketTimeout", "cancelSignalTimeout"):
+            self.assertIn(unittest.mock.call(name, "3"), props.setProperty.call_args_list)
+
+        spark._jvm.org.postgresql.Driver.return_value.connect.side_effect = None
+        connection = spark._jvm.org.postgresql.Driver.return_value.connect.return_value
+        writer.record_pipeline_heartbeat("b213c031-371c-4f95-8b8d-e08ab4bd953f")
+        connection.createStatement.return_value.setQueryTimeout.assert_called_once_with(3)
+        connection.createStatement.return_value.close.assert_called_once_with()
+        connection.close.assert_called_once_with()
 
 
 class WindowResultsWriterTests(unittest.TestCase):
@@ -110,6 +193,28 @@ class WindowAggregationTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.spark.stop()
 
+    def test_idle_stream_keeps_heartbeating_after_a_database_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            raw = self.spark.readStream.schema("value STRING").json(directory)
+            query = raw.writeStream.format("memory").queryName("idle_heartbeat_test").start()
+            calls = []
+
+            def heartbeat():
+                calls.append(None)
+                if len(calls) == 1:
+                    raise OSError("database unavailable")
+                signal.raise_signal(signal.SIGTERM)
+
+            try:
+                with patch.object(transaction_stream, "PIPELINE_HEARTBEAT_INTERVAL_SECONDS", 1), \
+                        patch("sys.stderr", io.StringIO()):
+                    transaction_stream.wait_for_query(query, heartbeat=heartbeat)
+                self.assertEqual(len(calls), 2)
+                self.assertFalse(query.isActive)
+                self.assertTrue(all(p["numInputRows"] == 0 for p in query.recentProgress))
+            finally:
+                query.stop()
+
     def raw_events(self, events):
         return self.spark.createDataFrame(
             [
@@ -170,7 +275,7 @@ class WindowAggregationTests(unittest.TestCase):
                       "unsupported_currency"))
 
         parsed = transaction_stream.parse_transactions(
-            self.raw_events([(key, value) for _, key, value, _ in cases]), "30 seconds"
+            self.raw_events([(key, value) for _, key, value, _ in cases])
         )
         actual = {
             row.offset: row.validation_error
@@ -194,11 +299,176 @@ class WindowAggregationTests(unittest.TestCase):
                 ("account-001", json.dumps({**valid, "merchant_category": None})),
                 ("account-001", json.dumps({**valid, "simulated_late": None})),
             ]),
-            "30 seconds",
         )
         self.assertEqual(
             transaction_stream.aggregate_transactions(parsed, "1 minute").collect(), []
         )
+
+    def test_business_rules_match_contract_and_exclude_invalid_transactions(self) -> None:
+        valid = self.valid_event()
+        properties = json.loads(
+            (PROJECT_ROOT / "contracts/transaction-schema.json").read_text()
+        )["properties"]
+        accepted = [
+            {**valid, "merchant_category": category}
+            for category in properties["merchant_category"]["enum"]
+        ] + [
+            {**valid, "amount_vnd": properties["amount_vnd"]["minimum"] + 1},
+            {**valid, "sequence": properties["sequence"]["minimum"] + 1},
+            {**valid, "transaction_id": valid["transaction_id"].upper()},
+            {**valid, "transaction_id": "00000000-0000-0000-0000-000000000000"},
+            {**valid, "account_id": "account-1000", "merchant_id": "merchant-1000"},
+            {**valid, "account_id": "account-000", "merchant_id": "merchant-000"},
+        ]
+        cases = [(f"valid_{i}", event, None) for i, event in enumerate(accepted)]
+        invalid = [
+            ("amount_vnd", [-1000, 0, properties["amount_vnd"]["minimum"] - 1],
+             "invalid_amount_vnd"),
+            ("sequence", [-1, properties["sequence"]["minimum"] - 1], "invalid_sequence"),
+            ("merchant_category", ["not-in-contract", "Grocery", "grocery "],
+             "unsupported_merchant_category"),
+            ("transaction_id", ["tx1", valid["transaction_id"].replace("-", ""),
+                                "g213c031-371c-4f95-8b8d-e08ab4bd953f",
+                                valid["transaction_id"] + "\n"], "invalid_transaction_id"),
+            ("account_id", ["account-01", "account-abc", "Account-001", "account-001\n"],
+             "invalid_account_id"),
+            ("merchant_id", ["merchant-01", "merchant-abc", "Merchant-001", "merchant-001\n"],
+             "invalid_merchant_id"),
+        ]
+        for field, values, error in invalid:
+            cases.extend((f"{field}_{value!r}", {**valid, field: value}, error)
+                         for value in values)
+        # Match the Kafka key even for malformed account IDs to test the ID rule itself.
+        raw = self.raw_events([
+            (event["account_id"], json.dumps(event)) for _, event, _ in cases
+        ])
+        parsed = transaction_stream.parse_transactions(raw)
+        errors = {
+            row.offset: row.validation_error
+            for row in parsed.select("offset", "validation_error").collect()
+        }
+        for offset, (name, _, expected) in enumerate(cases):
+            with self.subTest(case=name):
+                self.assertEqual(errors[offset], expected)
+
+        expected_results = {}
+        for event in accepted:
+            category = event["merchant_category"]
+            count, amount = expected_results.get(category, (0, 0))
+            expected_results[category] = (count + 1, amount + event["amount_vnd"])
+        prepared = transaction_stream.prepare_transactions(raw, "30 seconds")
+        actual_results = {
+            row.merchant_category: (row.transaction_count, row.total_amount_vnd)
+            for row in transaction_stream.aggregate_transactions(prepared, "1 minute").collect()
+        }
+        self.assertEqual(actual_results, expected_results)
+
+    def test_future_timestamp_guard_allows_clock_skew_and_old_events(self) -> None:
+        reference = datetime(2026, 10, 30, 1, 0, 10, tzinfo=timezone.utc)
+
+        def stamp(value):
+            return value.isoformat().replace("+00:00", "Z")
+
+        valid = self.valid_event()
+        events = [
+            valid,
+            {**valid, "event_time": stamp(reference + timedelta(seconds=30))},
+            {**valid, "event_time": stamp(reference + timedelta(seconds=31))},
+            {**valid, "produced_at": stamp(reference + timedelta(seconds=31))},
+            {**valid, "event_time": stamp(reference - timedelta(minutes=5)),
+             "simulated_late": True},
+        ]
+        clock = transaction_stream.F.lit(reference)
+        with patch.object(transaction_stream.F, "current_timestamp", return_value=clock):
+            parsed = transaction_stream.parse_transactions(
+                self.raw_events([("account-001", json.dumps(event)) for event in events]),
+                max_future_skew_seconds=30,
+            )
+        errors = {
+            row.offset: row.validation_error
+            for row in parsed.select("offset", "validation_error").collect()
+        }
+        self.assertEqual(errors, {0: None, 1: None, 2: "future_timestamp",
+                                  3: "future_timestamp", 4: None})
+
+    def test_rejected_events_cannot_advance_stream_watermark(self) -> None:
+        # Keep both valid events inside one window regardless of the test start second.
+        base_time = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(
+            second=10, microsecond=0
+        )
+
+        def stamp(value):
+            return value.isoformat().replace("+00:00", "Z")
+
+        valid = {**self.valid_event(), "event_time": stamp(base_time),
+                 "produced_at": stamp(base_time)}
+        future = stamp(base_time + timedelta(days=3650))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            incoming = root / "incoming"
+            incoming.mkdir()
+            raw = self.spark.readStream.schema(
+                "key STRING, value STRING, topic STRING, partition INT, offset LONG, "
+                "timestamp TIMESTAMP"
+            ).json(str(incoming))
+            transactions = transaction_stream.prepare_transactions(raw, "30 seconds")
+            transactions = transactions.observe(
+                "transaction-latency",
+                transaction_stream.F.avg("processing_latency_ms").alias("latency_avg_ms"),
+                transaction_stream.F.expr(
+                    "percentile_approx(processing_latency_ms, 0.95)"
+                ).alias("latency_p95_ms"),
+                transaction_stream.F.max("processing_latency_ms").alias("latency_max_ms"),
+            )
+            updates = []
+
+            def consume(batch, _batch_id):
+                updates.extend(row.asDict() for row in batch.collect())
+
+            query = (
+                transaction_stream.aggregate_transactions(transactions, "1 minute")
+                .writeStream.outputMode("update").foreachBatch(consume)
+                .option("checkpointLocation", str(root / "checkpoint")).start()
+            )
+            try:
+                def feed(name, events):
+                    rows = [dict(key="account-001", value=json.dumps(event),
+                                 topic="raw-events", partition=0, offset=i,
+                                 timestamp=stamp(base_time))
+                            for i, event in enumerate(events)]
+                    staging = root / name
+                    staging.write_text("\n".join(json.dumps(row) for row in rows))
+                    staging.replace(incoming / name)
+                    query.processAllAvailable()
+
+                feed("first.json", [valid, {**valid, "currency": "USD", "event_time": future}])
+                # A batch containing only rejected events must not move the watermark.
+                feed("invalid.json", [
+                    {**valid, "event_time": future},
+                    {**valid, "event_time": future, "produced_at": future},
+                    {**valid, "amount_vnd": -1000},
+                    {**valid, "merchant_category": "not-in-contract"},
+                    {**valid, "sequence": 0},
+                ])
+                self.assertEqual(len(updates), 1)
+                feed("second.json", [{**valid, "sequence": 2,
+                                     "event_time": stamp(base_time + timedelta(seconds=1))}])
+                self.assertEqual(updates[-1]["transaction_count"], 2)
+                self.assertEqual(updates[-1]["total_amount_vnd"], 2000)
+                count_before_late = len(updates)
+                feed("late.json", [{**valid, "event_time": stamp(base_time - timedelta(minutes=5)),
+                                   "simulated_late": True}])
+                self.assertEqual(len(updates), count_before_late)
+                progress = list(query.recentProgress)
+                dropped = sum(op.get("numRowsDroppedByWatermark", 0)
+                              for batch in progress for op in batch.get("stateOperators", []))
+                self.assertGreater(dropped, 0)
+                watermarks = [datetime.fromisoformat(batch["eventTime"]["watermark"].replace("Z", "+00:00"))
+                              for batch in progress if batch.get("eventTime", {}).get("watermark")]
+                self.assertTrue(watermarks)
+                self.assertLessEqual(max(watermarks), base_time + timedelta(seconds=1))
+            finally:
+                query.stop()
 
     def test_aggregation_separates_actual_kafka_topics(self) -> None:
         event_time = datetime(2026, 10, 30, 1, 0, 10, tzinfo=timezone.utc)
@@ -403,6 +673,17 @@ class BatchMetricsTests(unittest.TestCase):
 
 
 class SparkStreamingHelperTests(unittest.TestCase):
+    def test_future_skew_configuration_is_non_negative(self) -> None:
+        with patch.dict(os.environ, {"SPARK_MAX_FUTURE_SKEW_SECONDS": "45"}):
+            self.assertEqual(transaction_stream.parse_args([]).max_future_skew_seconds, 45)
+            args = transaction_stream.parse_args(["--max-future-skew-seconds", "0"])
+            self.assertEqual(args.max_future_skew_seconds, 0)
+        with patch.dict(os.environ, {"SPARK_MAX_FUTURE_SKEW_SECONDS": ""}):
+            self.assertEqual(transaction_stream.parse_args([]).max_future_skew_seconds, 30)
+        with patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                transaction_stream.parse_args(["--max-future-skew-seconds", "-1"])
+
     def test_checkpoint_defaults_are_stable_and_separate_topics(self) -> None:
         with patch.dict(os.environ, {"SPARK_CHECKPOINT_LOCATION": ""}):
             default_args = transaction_stream.parse_args([])

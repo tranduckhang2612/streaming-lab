@@ -7,9 +7,20 @@ import os
 import re
 import signal
 import sys
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+import time
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 DEFAULT_CHECKPOINT_ROOT = "file:///opt/spark/work-dir/checkpoints/transaction-window-v3"
+PIPELINE_HEARTBEAT_INTERVAL_SECONDS = 5
+PIPELINE_DB_TIMEOUT_SECONDS = 3
+
+# Business rules from contracts/transaction-schema.json.
+MERCHANT_CATEGORIES = ("grocery", "restaurant", "shopping", "transport", "utilities")
+MIN_AMOUNT_VND = 1000
+MIN_SEQUENCE = 1
+TRANSACTION_ID_PATTERN = r"\A[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\z"
+ACCOUNT_ID_PATTERN = r"\Aaccount-[0-9]{3,}\z"
+MERCHANT_ID_PATTERN = r"\Amerchant-[0-9]{3,}\z"
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession  # type: ignore
@@ -268,45 +279,38 @@ class PostgresWriter:
         self.url = f"jdbc:postgresql://{host}:{port}/{database}"
         self.user = user
         self.password = password
-    def _get_connection(self) -> Any:
+
+    def _get_connection(self, timeout_seconds: int | None = None) -> Any:
         props = self.spark._jvm.java.util.Properties()
         props.setProperty("user", self.user)
         props.setProperty("password", self.password)
+        if timeout_seconds is not None:
+            # Bound lifecycle writes even when PostgreSQL disappears at shutdown.
+            for name in ("loginTimeout", "connectTimeout", "socketTimeout", "cancelSignalTimeout"):
+                props.setProperty(name, str(timeout_seconds))
 
-        # 1. Try directly instantiating Driver via Py4J
+        # Fall back only for class loading, not for a failed database connection.
         try:
             driver = self.spark._jvm.org.postgresql.Driver()
-            conn = driver.connect(self.url, props)
-            if conn is not None:
-                return conn
         except Exception:
-            pass
+            try:
+                cl = self.spark._jvm.java.lang.Thread.currentThread().getContextClassLoader()
+                driver = cl.loadClass("org.postgresql.Driver").newInstance()
+            except Exception:
+                try:
+                    self.spark._jvm.java.lang.Class.forName("org.postgresql.Driver")
+                except Exception:
+                    pass
+                return self.spark._jvm.java.sql.DriverManager.getConnection(self.url, props)
+        return driver.connect(self.url, props)
 
-        # 2. Try loading driver class via context class loader
-        try:
-            cl = self.spark._jvm.java.lang.Thread.currentThread().getContextClassLoader()
-            driver_class = cl.loadClass("org.postgresql.Driver")
-            driver = driver_class.newInstance()
-            conn = driver.connect(self.url, props)
-            if conn is not None:
-                return conn
-        except Exception:
-            pass
-
-        # 3. Fallback to DriverManager
-        try:
-            self.spark._jvm.java.lang.Class.forName("org.postgresql.Driver")
-        except Exception:
-            pass
-        return self.spark._jvm.java.sql.DriverManager.getConnection(
-            self.url, props
-        )
-
-    def execute(self, sql: str) -> None:
-        conn = self._get_connection()
+    def execute(self, sql: str, timeout_seconds: int | None = None) -> None:
+        conn = self._get_connection(timeout_seconds)
         try:
             stmt = conn.createStatement()
             try:
+                if timeout_seconds is not None:
+                    stmt.setQueryTimeout(timeout_seconds)
                 stmt.execute(sql)
             finally:
                 stmt.close()
@@ -327,6 +331,7 @@ class PostgresWriter:
     ) -> None:
         config_json = json.dumps(configuration, ensure_ascii=False)
         sql = f"""
+BEGIN;
 INSERT INTO streaming.pipeline_runs (
     spark_run_id,
     query_id,
@@ -338,7 +343,8 @@ INSERT INTO streaming.pipeline_runs (
     trigger_interval_seconds,
     started_at,
     status,
-    configuration
+    configuration,
+    last_heartbeat_at
 ) VALUES (
     {sql_literal(spark_run_id)}::UUID,
     {sql_literal(query_id)}::UUID,
@@ -350,7 +356,8 @@ INSERT INTO streaming.pipeline_runs (
     {sql_literal(trigger_interval_seconds)},
     CURRENT_TIMESTAMP,
     'running',
-    {sql_literal(config_json)}::JSONB
+    {sql_literal(config_json)}::JSONB,
+    CURRENT_TIMESTAMP
 )
 ON CONFLICT (spark_run_id) DO UPDATE SET
     query_id = EXCLUDED.query_id,
@@ -362,22 +369,55 @@ ON CONFLICT (spark_run_id) DO UPDATE SET
     trigger_interval_seconds = EXCLUDED.trigger_interval_seconds,
     status = 'running',
     configuration = EXCLUDED.configuration,
-    finished_at = NULL;
+    finished_at = NULL,
+    last_heartbeat_at = CURRENT_TIMESTAMP,
+    superseded_by_run_id = NULL;
+
+-- A checkpoint keeps query_id across restarts, but allocates a new run ID.
+-- Preserve the unknown outcome/finish time of a run that lost its final write.
+UPDATE streaming.pipeline_runs SET
+    superseded_by_run_id = {sql_literal(spark_run_id)}::UUID
+WHERE query_id = {sql_literal(query_id)}::UUID
+  AND spark_run_id <> {sql_literal(spark_run_id)}::UUID
+  AND status = 'running'
+  AND superseded_by_run_id IS NULL;
+COMMIT;
 """
-        self.execute(sql)
+        self.execute(sql, timeout_seconds=PIPELINE_DB_TIMEOUT_SECONDS)
+
+    def record_pipeline_heartbeat(self, spark_run_id: str) -> None:
+        self.execute(
+            f"""
+UPDATE streaming.pipeline_runs SET last_heartbeat_at = CURRENT_TIMESTAMP
+WHERE spark_run_id = {sql_literal(spark_run_id)}::UUID
+  AND status = 'running'
+  AND superseded_by_run_id IS NULL;
+""",
+            timeout_seconds=PIPELINE_DB_TIMEOUT_SECONDS,
+        )
 
     def record_pipeline_finish(
         self,
         spark_run_id: str,
         status: str = "stopped",
     ) -> None:
+        if status not in ("stopped", "failed"):
+            raise ValueError(f"Invalid terminal pipeline status: {status}")
         sql = f"""
 UPDATE streaming.pipeline_runs SET
     finished_at = CURRENT_TIMESTAMP,
     status = {sql_literal(status)}
-WHERE spark_run_id = {sql_literal(spark_run_id)}::UUID;
+WHERE spark_run_id = {sql_literal(spark_run_id)}::UUID
+  AND status = 'running';
 """
-        self.execute(sql)
+        for attempt in range(3):
+            try:
+                self.execute(sql, timeout_seconds=PIPELINE_DB_TIMEOUT_SECONDS)
+                return
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(1)
 
     def save_window_results(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -602,6 +642,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--watermark", default="30 seconds")
+    parser.add_argument(
+        "--max-future-skew-seconds",
+        type=int,
+        default=os.getenv("SPARK_MAX_FUTURE_SKEW_SECONDS") or "30",
+        help="Maximum future timestamp skew relative to Spark's batch clock (default: 30).",
+    )
     parser.add_argument("--window-duration", default="1 minute")
     parser.add_argument("--trigger-interval", default="5 seconds")
     parser.add_argument(
@@ -634,7 +680,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.max_future_skew_seconds < 0:
+        parser.error("--max-future-skew-seconds must be non-negative")
     if not args.checkpoint_location:
         args.checkpoint_location = f"{DEFAULT_CHECKPOINT_ROOT}/{args.topic}"
     return args
@@ -655,7 +704,12 @@ def read_transactions(
     )
 
 
-def parse_transactions(raw: DataFrame, watermark: str) -> DataFrame:
+def parse_transactions(
+    raw: DataFrame,
+    max_future_skew_seconds: int = 30,
+) -> DataFrame:
+    if max_future_skew_seconds < 0:
+        raise ValueError("max_future_skew_seconds must be non-negative")
     decoded = raw.select(
         F.col("key").cast("string").alias("kafka_key"),
         F.col("value").cast("string").alias("raw_value"),
@@ -682,7 +736,7 @@ def parse_transactions(raw: DataFrame, watermark: str) -> DataFrame:
         "offset",
         "kafka_timestamp",
         "transaction.*",
-    )
+    ).withColumn("ingested_at", F.current_timestamp())
 
     required_fields_present = F.lit(True)
     for field in TRANSACTION_SCHEMA.fields:
@@ -691,6 +745,14 @@ def parse_transactions(raw: DataFrame, watermark: str) -> DataFrame:
         if isinstance(field.dataType, StringType):
             present = present & (F.length(F.trim(value)) > 0)
         required_fields_present = required_fields_present & present
+
+    future_limit_ms = F.unix_millis("ingested_at") + F.lit(
+        max_future_skew_seconds * 1000
+    )
+    future_timestamp = (
+        (F.unix_millis("event_time") > future_limit_ms)
+        | (F.unix_millis("produced_at") > future_limit_ms)
+    )
 
     return (
         parsed.withColumn(
@@ -703,10 +765,28 @@ def parse_transactions(raw: DataFrame, watermark: str) -> DataFrame:
                 ~F.col("kafka_key").eqNullSafe(F.col("account_id")),
                 F.lit("key_mismatch"),
             )
-            .when(F.col("currency") != F.lit("VND"), F.lit("unsupported_currency")),
+            .when(F.col("currency") != F.lit("VND"), F.lit("unsupported_currency"))
+            .when(
+                ~F.col("transaction_id").rlike(TRANSACTION_ID_PATTERN),
+                F.lit("invalid_transaction_id"),
+            )
+            .when(
+                ~F.col("account_id").rlike(ACCOUNT_ID_PATTERN),
+                F.lit("invalid_account_id"),
+            )
+            .when(
+                ~F.col("merchant_id").rlike(MERCHANT_ID_PATTERN),
+                F.lit("invalid_merchant_id"),
+            )
+            .when(
+                ~F.col("merchant_category").isin(*MERCHANT_CATEGORIES),
+                F.lit("unsupported_merchant_category"),
+            )
+            .when(F.col("amount_vnd") < MIN_AMOUNT_VND, F.lit("invalid_amount_vnd"))
+            .when(F.col("sequence") < MIN_SEQUENCE, F.lit("invalid_sequence"))
+            .when(future_timestamp, F.lit("future_timestamp")),
         )
         .drop("_corrupt_record")
-        .withColumn("ingested_at", F.current_timestamp())
         .withColumn(
             "event_lateness_ms",
             F.unix_millis("produced_at") - F.unix_millis("event_time"),
@@ -715,6 +795,18 @@ def parse_transactions(raw: DataFrame, watermark: str) -> DataFrame:
             "processing_latency_ms",
             F.unix_millis("ingested_at") - F.unix_millis("produced_at"),
         )
+    )
+
+
+def prepare_transactions(
+    raw: DataFrame,
+    watermark: str,
+    max_future_skew_seconds: int = 30,
+) -> DataFrame:
+    # Watermark and observations must never see rejected event timestamps.
+    return (
+        parse_transactions(raw, max_future_skew_seconds)
+        .filter(F.col("validation_error").isNull())
         .withWatermark("event_time", watermark)
     )
 
@@ -759,8 +851,9 @@ def aggregate_transactions(
     )
 
 
-def wait_for_query(query: Any) -> None:
+def wait_for_query(query: Any, heartbeat: Callable[[], None] | None = None) -> None:
     stop_requested = False
+    next_heartbeat = time.monotonic() + PIPELINE_HEARTBEAT_INTERVAL_SECONDS
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop_requested
@@ -777,6 +870,17 @@ def wait_for_query(query: Any) -> None:
                 print("\nStop signal received. Stopping streaming query...", flush=True)
                 query.stop()
                 return
+            if heartbeat is not None and time.monotonic() >= next_heartbeat:
+                try:
+                    heartbeat()
+                except Exception as exc:
+                    print(
+                        f"Failed to record pipeline heartbeat: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                # Retry on the normal cadence, including after a database outage.
+                next_heartbeat = time.monotonic() + PIPELINE_HEARTBEAT_INTERVAL_SECONDS
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
@@ -810,7 +914,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         topic=args.topic,
         starting_offsets=args.starting_offsets,
     )
-    transactions = parse_transactions(raw, args.watermark)
+    transactions = prepare_transactions(
+        raw, args.watermark, args.max_future_skew_seconds
+    )
     transactions = transactions.observe(
         "transaction-latency",
         F.avg("processing_latency_ms").alias("latency_avg_ms"),
@@ -844,32 +950,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Spark transaction window stream started: "
         f"query_id={query.id}, spark_run_id={query.runId}, "
         f"topic={args.topic}, watermark={args.watermark}, "
+        f"max_future_skew_seconds={args.max_future_skew_seconds}, "
         f"window={args.window_duration}, "
         f"trigger={args.trigger_interval}, checkpoint={args.checkpoint_location}",
         flush=True,
     )
 
-    db_writer.record_pipeline_start(
-        spark_run_id=str(query.runId),
-        query_id=str(query.id),
-        topic=args.topic,
-        checkpoint_location=args.checkpoint_location,
-        watermark_delay_seconds=parse_duration_to_seconds(args.watermark),
-        window_duration_seconds=parse_duration_to_seconds(args.window_duration),
-        trigger_interval_seconds=parse_duration_to_seconds(args.trigger_interval),
-        configuration={
-            "topic": args.topic,
-            "watermark": args.watermark,
-            "window_duration": args.window_duration,
-            "trigger_interval": args.trigger_interval,
-            "checkpoint_location": args.checkpoint_location,
-            "starting_offsets": args.starting_offsets,
-        },
-    )
-
+    spark_run_id = str(query.runId)
     status = "stopped"
     try:
-        wait_for_query(query)
+        db_writer.record_pipeline_start(
+            spark_run_id=spark_run_id,
+            query_id=str(query.id),
+            topic=args.topic,
+            checkpoint_location=args.checkpoint_location,
+            watermark_delay_seconds=parse_duration_to_seconds(args.watermark),
+            window_duration_seconds=parse_duration_to_seconds(args.window_duration),
+            trigger_interval_seconds=parse_duration_to_seconds(args.trigger_interval),
+            configuration={
+                "topic": args.topic,
+                "watermark": args.watermark,
+                "max_future_skew_seconds": args.max_future_skew_seconds,
+                "window_duration": args.window_duration,
+                "trigger_interval": args.trigger_interval,
+                "checkpoint_location": args.checkpoint_location,
+                "starting_offsets": args.starting_offsets,
+            },
+        )
+        wait_for_query(
+            query, heartbeat=lambda: db_writer.record_pipeline_heartbeat(spark_run_id)
+        )
     except Exception as exc:
         print(
             f"Streaming query terminated with error: {exc}",
@@ -877,10 +987,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             flush=True,
         )
         status = "failed"
+        try:
+            query.stop()
+        except Exception as stop_exc:
+            print(f"Failed to stop streaming query: {stop_exc}", file=sys.stderr, flush=True)
         raise
     finally:
         try:
-            db_writer.record_pipeline_finish(str(query.runId), status=status)
+            db_writer.record_pipeline_finish(spark_run_id, status=status)
         except Exception as exc:
             print(
                 f"Failed to record pipeline finish: {exc}",

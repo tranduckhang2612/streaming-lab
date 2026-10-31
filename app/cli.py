@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     late.add_argument("--late-ratios", nargs="+", type=ratio)
     _add_generator_options(late, include_late_ratio=False)
 
-    partition = kinds.add_parser("partition", help="Compare partition counts.")
+    partition = kinds.add_parser("partition", help="Compare partition counts through Kafka and Spark.")
     partition.add_argument("--partitions", nargs="+", type=positive_int)
     _add_generator_options(
         partition,
@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         OSError,
         RuntimeError,
         ValueError,
-        subprocess.CalledProcessError,
+        subprocess.SubprocessError,
     ) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -215,11 +215,12 @@ def _add_generator_options(
 def _print_report(report: RunReport) -> None:
     print("\n=== Run summary ===")
     for result in report.results:
+        spark_status = f", spark={result['spark_status']}" if "spark_status" in result else ""
         print(
             f"{result['scenario']}: status={result['status']}, "
             f"delivered={result['delivered']}, "
             f"rate={result['delivered_rate_events_s']}/s, "
-            f"late={result['actual_late_ratio_percent']}%"
+            f"late={result['actual_late_ratio_percent']}%{spark_status}"
         )
     if report.csv_path:
         print(f"CSV result: {report.csv_path}")
@@ -240,6 +241,8 @@ def _print_config(config: AppConfig) -> None:
         "runtime": {
             "bootstrap_servers": config.runtime.bootstrap_servers,
             "skip_build": config.runtime.skip_build,
+            "spark_startup_timeout_seconds": config.runtime.spark_startup_timeout_seconds,
+            "spark_drain_timeout_seconds": config.runtime.spark_drain_timeout_seconds,
         },
     }
     print(json.dumps(values, indent=2, ensure_ascii=False))
