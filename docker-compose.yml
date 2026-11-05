@@ -191,7 +191,6 @@ services:
     hostname: spark-submit
     profiles: ["streaming"]
     restart: "no"
-    stop_grace_period: 60s
     depends_on:
       kafka:
         condition: service_healthy
@@ -205,14 +204,11 @@ services:
         condition: service_healthy
     environment:
       POSTGRES_HOST: postgres
-      # Container clients use PostgreSQL's internal port, independent of host publishing.
-      POSTGRES_PORT: "5432"
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_DB: ${POSTGRES_DB:-streaming_db}
       POSTGRES_USER: ${POSTGRES_USER:-streaming_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streaming_password}
     command:
-      - /bin/bash
-      - /opt/spark/apps/run_stream.sh
       - /opt/spark/bin/spark-submit
       - --master
       - spark://spark-master:7077
@@ -221,7 +217,7 @@ services:
       - --packages
       - org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0,org.postgresql:postgresql:42.7.3
       - --conf
-      - spark.driver.host=${SPARK_DRIVER_HOST:-spark-submit}
+      - spark.driver.host=spark-submit
       - --conf
       - spark.driver.bindAddress=0.0.0.0
       - --conf
@@ -234,11 +230,9 @@ services:
       - --topic
       - "${SPARK_INPUT_TOPIC:-raw-events}"
       - --checkpoint-location
-      - "${SPARK_CHECKPOINT_LOCATION:-}"
+      - "${SPARK_CHECKPOINT_LOCATION:-file:///opt/spark/work-dir/checkpoints/transaction-window-v2}"
       - --watermark
       - "${SPARK_WATERMARK:-30 seconds}"
-      - --max-future-skew-seconds
-      - "${SPARK_MAX_FUTURE_SKEW_SECONDS:-30}"
       - --window-duration
       - "${SPARK_WINDOW_DURATION:-1 minute}"
       - --trigger-interval
@@ -246,7 +240,7 @@ services:
       - --postgres-host
       - postgres
       - --postgres-port
-      - "5432"
+      - "${POSTGRES_PORT:-5432}"
       - --postgres-db
       - "${POSTGRES_DB:-streaming_db}"
       - --postgres-user
@@ -267,7 +261,6 @@ services:
     hostname: postgres
     restart: unless-stopped
     ports:
-      # POSTGRES_PORT changes the host endpoint only; the container listens on 5432.
       - "${POSTGRES_PORT:-5432}:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-streaming_db}
@@ -323,12 +316,14 @@ services:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin_password}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DATE_FORMATS_DEFAULT_TIMEZONE: UTC
       POSTGRES_DB: ${POSTGRES_DB:-streaming_db}
       POSTGRES_USER: ${POSTGRES_USER:-streaming_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streaming_password}
     volumes:
       - grafana-data:/var/lib/grafana
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/etc/grafana/dashboards:ro
     depends_on:
       postgres:
         condition: service_healthy
