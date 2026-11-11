@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from decimal import Decimal, InvalidOperation
 import json
 import math
 from pathlib import Path
@@ -11,10 +12,44 @@ from typing import Any, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.json"
+MAX_WATERMARK_SECONDS = Decimal("999999999.999")
+WATERMARK_PRECISION = Decimal("0.001")
 
 
 class ConfigError(ValueError):
     """Raised when config.json contains an invalid value."""
+
+
+def canonical_watermark_seconds(value: object) -> float:
+    """Normalize a watermark to the NUMERIC(12,3) database domain."""
+    return float(_watermark_decimal(value))
+
+
+def watermark_seconds_text(value: object) -> str:
+    """Return a non-scientific Spark duration value without trailing zeros."""
+    return format(_watermark_decimal(value).normalize(), "f")
+
+
+def _watermark_decimal(value: object) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            "watermark must be a number from 0 to 999999999.999 seconds"
+        )
+    try:
+        decimal_value = Decimal(str(value))
+    except InvalidOperation as exc:
+        raise ConfigError("watermark must be a finite number") from exc
+    if (
+        not decimal_value.is_finite()
+        or decimal_value < 0
+        or decimal_value > MAX_WATERMARK_SECONDS
+        or decimal_value != decimal_value.quantize(WATERMARK_PRECISION)
+    ):
+        raise ConfigError(
+            "watermark must be finite, between 0 and 999999999.999 seconds, "
+            "with at most 3 decimal places"
+        )
+    return Decimal(0) if decimal_value == 0 else decimal_value
 
 
 @dataclass(frozen=True)
@@ -77,6 +112,7 @@ class GeneratorConfig:
 class ExperimentConfig:
     rates: tuple[float, ...] = (10.0, 100.0, 500.0)
     late_ratios: tuple[float, ...] = (0.0, 0.10, 0.30)
+    watermarks: tuple[float, ...] = (10.0, 30.0, 60.0)
     partitions: tuple[int, ...] = (1, 3, 6)
     topic_prefix: str = "raw-events-p"
     results_dir: str = "results"
@@ -91,6 +127,15 @@ class ExperimentConfig:
             raise ConfigError(
                 "experiments.late_ratios must contain values between 0 and 1"
             )
+        if not self.watermarks:
+            raise ConfigError("experiments.watermarks cannot be empty")
+        try:
+            normalized_watermarks = tuple(
+                canonical_watermark_seconds(value) for value in self.watermarks
+            )
+        except ConfigError as exc:
+            raise ConfigError(f"experiments.watermarks: {exc}") from exc
+        object.__setattr__(self, "watermarks", normalized_watermarks)
         if not self.partitions or any(value <= 0 for value in self.partitions):
             raise ConfigError(
                 "experiments.partitions must contain positive integers"
@@ -142,6 +187,9 @@ class AppConfig:
                 rates=tuple(experiment_values.get("rates", (10, 100, 500))),
                 late_ratios=tuple(
                     experiment_values.get("late_ratios", (0, 0.1, 0.3))
+                ),
+                watermarks=tuple(
+                    experiment_values.get("watermarks", (10, 30, 60))
                 ),
                 partitions=tuple(
                     experiment_values.get("partitions", (1, 3, 6))

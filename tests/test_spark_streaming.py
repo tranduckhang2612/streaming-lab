@@ -174,6 +174,34 @@ class WindowResultsWriterTests(unittest.TestCase):
             [("raw-events-p1", 2, 2000), ("raw-events-p3", 1, 1000)],
         )
 
+    def test_experiment_results_are_written_with_run_scenario_and_batch(self) -> None:
+        writer = transaction_stream.PostgresWriter(spark=None)
+        row = {
+            "topic": "raw-events",
+            "window_start": datetime(2026, 10, 30, 1, 0, tzinfo=timezone.utc),
+            "window_end": datetime(2026, 10, 30, 1, 1, tzinfo=timezone.utc),
+            "merchant_category": "grocery",
+            "transaction_count": 1,
+            "total_amount_vnd": 1000,
+            "average_amount_vnd": 1000,
+            "min_amount_vnd": 1000,
+            "max_amount_vnd": 1000,
+            "simulated_late_count": 1,
+            "average_event_lateness_ms": 45000,
+        }
+        with patch.object(writer, "execute") as execute:
+            writer.save_window_results(
+                [row],
+                experiment_run_id="11111111-1111-4111-8111-111111111111",
+                scenario_name="watermark-10s",
+                batch_id=3,
+            )
+        sql = execute.call_args.args[0]
+        self.assertIn("INSERT INTO streaming.experiment_window_actuals", sql)
+        self.assertIn("watermark-10s", sql)
+        self.assertIn("11111111-1111-4111-8111-111111111111", sql)
+        self.assertIn("45000, 3, CURRENT_TIMESTAMP", sql)
+
 
 @unittest.skipUnless(os.getenv("RUN_SPARK_TESTS") == "1", "requires a Spark runtime")
 class WindowAggregationTests(unittest.TestCase):
@@ -673,6 +701,19 @@ class BatchMetricsTests(unittest.TestCase):
 
 
 class SparkStreamingHelperTests(unittest.TestCase):
+    def test_experiment_identity_arguments_must_be_paired(self) -> None:
+        args = transaction_stream.parse_args([
+            "--experiment-run-id", "11111111-1111-4111-8111-111111111111",
+            "--experiment-scenario-name", "watermark-10s",
+        ])
+        self.assertEqual(args.experiment_scenario_name, "watermark-10s")
+        with patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                transaction_stream.parse_args([
+                    "--experiment-run-id",
+                    "11111111-1111-4111-8111-111111111111",
+                ])
+
     def test_future_skew_configuration_is_non_negative(self) -> None:
         with patch.dict(os.environ, {"SPARK_MAX_FUTURE_SKEW_SECONDS": "45"}):
             self.assertEqual(transaction_stream.parse_args([]).max_future_skew_seconds, 45)

@@ -100,6 +100,18 @@ class ExperimentStore:
             if isinstance(partition_counts, Mapping)
             else partition_counts
         )
+        recovery_value = result.get("checkpoint_recovery")
+        recovery = recovery_value if isinstance(recovery_value, Mapping) else {}
+
+        def recovery_json(name: str) -> str | None:
+            value = recovery.get(name)
+            return (
+                json.dumps(value, separators=(",", ":"))
+                if isinstance(value, Mapping)
+                else None
+            )
+
+        has_recovery = bool(recovery)
         sql = f"""
 BEGIN;
 WITH inserted AS (
@@ -111,7 +123,13 @@ WITH inserted AS (
         seed, started_at, finished_at, expected_events, attempted, delivered,
         failed, simulated_late, remaining, elapsed_seconds,
         delivered_rate_events_s, rate_achievement_percent,
-        delivery_success_percent, actual_late_ratio_percent, status, result_data
+        delivery_success_percent, actual_late_ratio_percent,
+        spark_run_id, spark_query_id, spark_checkpoint_location,
+        spark_baseline_batch_id, spark_final_batch_id,
+        watermark_delay_seconds, ground_truth_status,
+        ground_truth_manifest_sha256, ground_truth_event_count,
+        ground_truth_window_count, ground_truth_error,
+        status, result_data
     ) VALUES (
         {sql_literal(run_id)}::UUID,
         {sequence_number},
@@ -139,14 +157,55 @@ WITH inserted AS (
         {sql_literal(result.get('rate_achievement_percent'))},
         {sql_literal(result.get('delivery_success_percent'))},
         {sql_literal(result.get('actual_late_ratio_percent'))},
+        {sql_literal(result.get('spark_run_id'))}::UUID,
+        {sql_literal(result.get('spark_query_id'))}::UUID,
+        {sql_literal(result.get('spark_checkpoint_location'))},
+        {sql_literal(result.get('spark_baseline_batch_id'))},
+        {sql_literal(result.get('spark_final_batch_id'))},
+        {sql_literal(result.get('watermark_delay_seconds'))},
+        {sql_literal(result.get('ground_truth_status', 'unavailable'))},
+        {sql_literal(result.get('ground_truth_manifest_sha256'))},
+        {sql_literal(result.get('ground_truth_event_count'))},
+        {sql_literal(result.get('ground_truth_window_count'))},
+        {sql_literal(result.get('ground_truth_error'))},
         {sql_literal(result['status'])},
         {sql_literal(result_json)}::JSONB
     )
     RETURNING scenario_id
+), inserted_log AS (
+    INSERT INTO streaming.experiment_logs (scenario_id, log_text)
+    SELECT scenario_id, {sql_literal(log_text)}
+    FROM inserted
+    RETURNING scenario_id
 )
-INSERT INTO streaming.experiment_logs (scenario_id, log_text)
-SELECT scenario_id, {sql_literal(log_text)}
-FROM inserted;
+INSERT INTO streaming.checkpoint_recovery_evidence (
+    scenario_id, before_spark_run_id, after_spark_run_id,
+    before_query_id, after_query_id, checkpoint_location,
+    before_stop_offsets, downtime_end_offsets, recovered_offsets,
+    backlog_event_count, phase1_delivered, downtime_delivered,
+    query_id_preserved, spark_run_changed, checkpoint_reused,
+    offsets_recovered, identity_status
+)
+SELECT
+    scenario_id,
+    {sql_literal(recovery.get('before_spark_run_id'))}::UUID,
+    {sql_literal(recovery.get('after_spark_run_id'))}::UUID,
+    {sql_literal(recovery.get('before_query_id'))}::UUID,
+    {sql_literal(recovery.get('after_query_id'))}::UUID,
+    {sql_literal(recovery.get('checkpoint_location'))},
+    {sql_literal(recovery_json('before_stop_offsets'))}::JSONB,
+    {sql_literal(recovery_json('downtime_end_offsets'))}::JSONB,
+    {sql_literal(recovery_json('recovered_offsets'))}::JSONB,
+    {sql_literal(recovery.get('backlog_event_count'))},
+    {sql_literal(recovery.get('phase1_delivered'))},
+    {sql_literal(recovery.get('downtime_delivered'))},
+    {sql_literal(recovery.get('query_id_preserved'))},
+    {sql_literal(recovery.get('spark_run_changed'))},
+    {sql_literal(recovery.get('checkpoint_reused'))},
+    {sql_literal(recovery.get('offsets_recovered'))},
+    {sql_literal(recovery.get('identity_status'))}
+FROM inserted_log
+WHERE {sql_literal(has_recovery)};
 COMMIT;
 """
         self._execute(sql)
@@ -165,6 +224,10 @@ COMMIT;
 SELECT json_build_object(
     'spark_run_id', r.spark_run_id,
     'query_id', r.query_id,
+    'checkpoint_location', r.checkpoint_location,
+    'watermark_delay_seconds', r.watermark_delay_seconds,
+    'window_duration_seconds', r.window_duration_seconds,
+    'trigger_interval_seconds', r.trigger_interval_seconds,
     'effective_status', r.effective_status,
     -- Idle progress may advertise the next batch ID before it executes.
     'batch_id', COALESCE((SELECT MAX(batch_id) FROM streaming.pipeline_batch_metrics
@@ -210,7 +273,13 @@ LIMIT 1;
             text=True,
             encoding="utf-8",
             capture_output=True,
-            check=True,
+            check=False,
             timeout=timeout_seconds,
         )
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(
+                "PostgreSQL command failed"
+                + (f": {detail}" if detail else f" (exit {completed.returncode})")
+            )
         return completed.stdout.strip()

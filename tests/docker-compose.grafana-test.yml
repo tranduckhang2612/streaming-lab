@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_DB: streaming_db
+      POSTGRES_USER: streaming_user
+      POSTGRES_PASSWORD: streaming_password
+    tmpfs:
+      - /var/lib/postgresql/data
+    volumes:
+      - ../database/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streaming_user -d streaming_db"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  grafana:
+    image: grafana/grafana:13.2.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin_password
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      POSTGRES_DB: streaming_db
+      POSTGRES_USER: streaming_user
+      POSTGRES_PASSWORD: streaming_password
+    volumes:
+      - grafana-test-data:/var/lib/grafana
+      - ../docker/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ../docker/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../docker/grafana/dashboards:/etc/grafana/dashboards:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  grafana-test-data:

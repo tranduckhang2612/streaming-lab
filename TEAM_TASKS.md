@@ -78,7 +78,7 @@ Nhiệm vụ:
    - watermark và số dòng bị loại bởi watermark;
    - thời gian commit checkpoint;
    - số lượng và tổng giá trị transaction theo window;
-   - so sánh rate, late ratio và partition giữa các thí nghiệm.
+   - so sánh rate, late ratio, watermark và partition giữa các thí nghiệm.
 3. Thêm bộ lọc thời gian, topic, Spark run và experiment run.
 4. Provision dashboard để chạy lại Docker Compose không phải cấu hình thủ công.
 
@@ -98,7 +98,10 @@ Kết quả bàn giao:
 | `query_id` | Định danh Spark query, giữ nguyên khi dùng lại checkpoint |
 | `spark_run_id` | Một phiên chạy Spark, thay đổi mỗi lần khởi động |
 
-Liên kết Spark metric với một thí nghiệm bằng `topic` và khoảng thời gian chạy.
+Liên kết Spark metric với một scenario bằng `experiment_scenarios.spark_run_id`
+và khoảng batch `(spark_baseline_batch_id, spark_final_batch_id]`. View
+`streaming.experiment_scenario_metrics` cung cấp dữ liệu tổng hợp cho Grafana;
+không suy đoán liên kết bằng topic hoặc khoảng thời gian.
 
 ### Công thức và đơn vị
 
@@ -130,9 +133,16 @@ checkpoint_commit_ms = wal_commit_ms
 2. Chạy generator ở tốc độ thấp và kiểm tra toàn bộ luồng.
 3. Tăng tốc độ phát để quan sát throughput, lag và backpressure.
 4. Thay đổi tỷ lệ event đến muộn và watermark.
+   Lệnh chuẩn: `python3 main.py experiment watermark --watermarks 10 30 60`.
 5. Dừng Spark, tiếp tục phát event, rồi khởi động lại để kiểm tra checkpoint.
+   Lệnh chuẩn: `python3 main.py experiment checkpoint --rate 20 --duration-seconds 10`.
+   Kiểm tra view `streaming.checkpoint_recovery_results`; chỉ chấp nhận khi
+   `checkpoint_recovery_verified = true`.
 6. Chạy lại với các số partition khác nhau.
 7. Chụp dashboard và lưu các truy vấn/kết quả dùng trong báo cáo.
+   Lệnh chuẩn: `python3 main.py export-evidence --run-id <RUN_ID>`.
+   Bundle phải có ảnh thể hiện bộ lọc run/scenario, CSV kết quả, dashboard JSON
+   chứa truy vấn SQL và `checksums.sha256`.
 
 ## 6. Tiêu chí hoàn thành
 

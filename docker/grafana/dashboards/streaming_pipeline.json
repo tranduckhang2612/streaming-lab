@@ -1,0 +1,630 @@
+{
+  "uid": "streaming-pipeline",
+  "title": "Streaming Pipeline",
+  "tags": [
+    "streaming"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "topic",
+        "label": "Topic",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "postgres-streaming"
+        },
+        "query": "SELECT DISTINCT topic FROM streaming.pipeline_runs ORDER BY 1",
+        "definition": "SELECT DISTINCT topic FROM streaming.pipeline_runs ORDER BY 1",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 0
+      },
+      {
+        "name": "spark_run_id",
+        "label": "Spark run",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "postgres-streaming"
+        },
+        "query": "SELECT spark_run_id::text AS __value, left(spark_run_id::text,8) || ' | ' || topic || ' | ' || to_char(started_at AT TIME ZONE 'UTC','MM-DD HH24:MI:SS') AS __text\nFROM streaming.pipeline_runs WHERE topic IN ($topic) ORDER BY started_at DESC",
+        "definition": "SELECT spark_run_id::text AS __value, left(spark_run_id::text,8) || ' | ' || topic || ' | ' || to_char(started_at AT TIME ZONE 'UTC','MM-DD HH24:MI:SS') AS __text\nFROM streaming.pipeline_runs WHERE topic IN ($topic) ORDER BY started_at DESC",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 0
+      },
+      {
+        "name": "experiment_run_id",
+        "label": "Experiment run",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "postgres-streaming"
+        },
+        "query": "SELECT run_id::text AS __value, experiment_type || ' | ' || topic || ' | ' || to_char(started_at AT TIME ZONE 'UTC','MM-DD HH24:MI:SS') AS __text\nFROM streaming.experiment_runs ORDER BY started_at DESC",
+        "definition": "SELECT run_id::text AS __value, experiment_type || ' | ' || topic || ' | ' || to_char(started_at AT TIME ZONE 'UTC','MM-DD HH24:MI:SS') AS __text\nFROM streaming.experiment_runs ORDER BY started_at DESC",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Input / processed throughput",
+      "description": "Nguồn: pipeline_batch_metrics. Đơn vị rows/second. NULL giữ nguyên, không thay bằng 0.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT observed_at AS time, input_rows_per_second AS \"Input rows/s\", processed_rows_per_second AS \"Processed rows/s\"\nFROM streaming.pipeline_batch_metrics\nWHERE $__timeFilter(observed_at) AND spark_run_id::text IN ($spark_run_id) AND topic IN ($topic)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:rows/s",
+          "custom": {
+            "spanNulls": false,
+            "insertNulls": 60000,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Consumer lag (tổng và lớn nhất)",
+      "description": "consumer_lag = latest_offset - end_offset. Đơn vị records.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT observed_at AS time, total_consumer_lag AS \"Total lag\", max_partition_lag AS \"Max partition lag\"\nFROM streaming.pipeline_batch_metrics\nWHERE $__timeFilter(observed_at) AND spark_run_id::text IN ($spark_run_id) AND topic IN ($topic)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:records",
+          "custom": {
+            "spanNulls": false,
+            "insertNulls": 60000,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "End-to-end latency (p95 / avg / max)",
+      "description": "end_to_end_latency_ms = thời điểm Spark xử lý - produced_at. p95 do Spark job tính theo từng micro-batch.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT observed_at AS time, latency_p95_ms AS \"p95\", latency_avg_ms AS \"avg\", latency_max_ms AS \"max\"\nFROM streaming.pipeline_batch_metrics\nWHERE $__timeFilter(observed_at) AND spark_run_id::text IN ($spark_run_id) AND topic IN ($topic)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "spanNulls": false,
+            "insertNulls": 60000,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Watermark: độ trễ so với thời điểm quan sát",
+      "description": "Khoảng cách giữa observed_at và watermark_at (giây). Batch chưa có watermark (mốc 1970) được coi là NULL, và giữa observed_at và max_event_time.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT observed_at AS time,\n  CASE WHEN watermark_at > '2000-01-01' THEN EXTRACT(EPOCH FROM (observed_at - watermark_at)) END AS \"Watermark gap (s)\",\n  CASE WHEN max_event_time > '2000-01-01' THEN EXTRACT(EPOCH FROM (observed_at - max_event_time)) END AS \"Max event time gap (s)\"\nFROM streaming.pipeline_batch_metrics\nWHERE $__timeFilter(observed_at) AND spark_run_id::text IN ($spark_run_id) AND topic IN ($topic)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "spanNulls": false,
+            "insertNulls": 60000,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Số dòng bị loại bởi watermark",
+      "description": "Cột rows_dropped_by_watermark theo từng batch.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT observed_at AS time, rows_dropped_by_watermark AS \"Dropped rows\"\nFROM streaming.pipeline_batch_metrics\nWHERE $__timeFilter(observed_at) AND spark_run_id::text IN ($spark_run_id) AND topic IN ($topic)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:rows",
+          "custom": {
+            "spanNulls": false,
+            "insertNulls": 60000,
+            "drawStyle": "bars",
+            "fillOpacity": 30,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Thời gian commit checkpoint",
+      "description": "checkpoint_commit_ms = wal_commit_ms + commit_offsets_ms + tổng stateOperators.commitTimeMs.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT observed_at AS time, checkpoint_commit_ms AS \"Checkpoint commit\", wal_commit_ms AS \"WAL commit\", commit_offsets_ms AS \"Commit offsets\"\nFROM streaming.pipeline_batch_metrics\nWHERE $__timeFilter(observed_at) AND spark_run_id::text IN ($spark_run_id) AND topic IN ($topic)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "spanNulls": false,
+            "insertNulls": 60000,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Số transaction theo window và merchant_category",
+      "description": "Nguồn: transaction_window_results, mốc thời gian là window_start.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT window_start AS time, merchant_category AS metric, transaction_count AS value\nFROM streaming.transaction_window_results\nWHERE $__timeFilter(window_start) AND topic IN ($topic)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "spanNulls": false,
+            "insertNulls": 60000,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Tổng giá trị transaction theo window (VND)",
+      "description": "total_amount_vnd theo window_start và merchant_category.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT window_start AS time, merchant_category AS metric, total_amount_vnd AS value\nFROM streaming.transaction_window_results\nWHERE $__timeFilter(window_start) AND topic IN ($topic)\nORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix: VND",
+          "custom": {
+            "spanNulls": false,
+            "insertNulls": 60000,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "auto",
+            "stacking": {
+              "mode": "none"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Thống kê theo merchant_category",
+      "description": "Tổng hợp trong khoảng thời gian đang chọn.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT merchant_category,\n  SUM(transaction_count) AS transactions,\n  SUM(total_amount_vnd) AS total_amount_vnd,\n  ROUND(SUM(total_amount_vnd)::numeric / NULLIF(SUM(transaction_count),0), 2) AS avg_amount_vnd,\n  MIN(min_amount_vnd) AS min_amount_vnd,\n  MAX(max_amount_vnd) AS max_amount_vnd,\n  SUM(simulated_late_count) AS late_events,\n  ROUND(SUM(average_event_lateness_ms * transaction_count) / NULLIF(SUM(transaction_count),0), 2) AS avg_lateness_ms\nFROM streaming.transaction_window_results\nWHERE $__timeFilter(window_start) AND topic IN ($topic)\nGROUP BY 1 ORDER BY 1",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "So sánh pipeline metrics giữa các scenario",
+      "description": "Metric Spark chỉ lấy trong khoảng batch (baseline, final] của từng scenario. Accuracy lấy từ evidence Kafka ACK và Spark actual cùng experiment/scenario; NULL nghĩa là evidence chưa hoàn chỉnh.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT left(m.experiment_run_id::text, 8) AS experiment_run,\n  m.experiment_started_at, m.experiment_type, m.scenario_name, m.topic,\n  m.partition_count, m.active_partitions, m.watermark_delay_seconds,\n  m.late_delay_seconds, m.window_duration_seconds, m.trigger_interval_seconds,\n  m.target_late_ratio_percent, m.actual_late_ratio_percent, m.simulated_late,\n  m.target_rate_events_s, m.delivered_rate_events_s, m.spark_input_rows,\n  m.avg_processed_rows_per_second, m.max_total_consumer_lag, m.max_partition_lag,\n  m.avg_batch_p95_latency_ms, m.max_batch_p95_latency_ms,\n  m.p95_checkpoint_commit_ms, m.rows_dropped_by_watermark,\n  a.total_expected_count, a.total_actual_count, a.total_missing_count,\n  a.total_extra_count, a.overall_count_accuracy_percent,\n  a.overall_amount_accuracy_percent, a.total_late_events_accepted,\n  a.total_late_events_dropped, a.accuracy_complete,\n  m.metric_batch_count, m.measured_dropped_batch_count,\n  m.measured_dropped_batch_count = m.metric_batch_count AS dropped_measurements_complete,\n  m.max_watermark_at, m.spark_run_id, m.spark_checkpoint_location,\n  m.metrics_bounds_complete, m.spark_status, m.pipeline_effective_status,\n  m.scenario_status\nFROM streaming.experiment_scenario_metrics m\nLEFT JOIN streaming.experiment_scenario_accuracy a\n  ON a.experiment_run_id = m.experiment_run_id\n AND a.scenario_name = m.scenario_name\nWHERE m.experiment_run_id::text = ANY(ARRAY[$experiment_run_id]::text[])\nORDER BY m.experiment_started_at, m.sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Các lần chạy Spark",
+      "description": "pipeline_run_status: effective_status suy ra từ heartbeat. query_id giữ nguyên khi dùng lại checkpoint, spark_run_id đổi mỗi lần khởi động.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT spark_run_id, query_id, topic, partition_count, started_at, finished_at, effective_status, watermark_delay_seconds, window_duration_seconds\nFROM streaming.pipeline_run_status\nWHERE topic IN ($topic)\nORDER BY started_at DESC",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    }
+  ],
+  "annotations": {
+    "list": []
+  }
+}

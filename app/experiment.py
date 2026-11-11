@@ -1,17 +1,30 @@
-"""One runner for custom, rate, late-ratio, and partition scenarios."""
+"""Runner for generator comparisons and checkpoint-recovery evidence."""
 
 from __future__ import annotations
 
 import csv
 from contextlib import nullcontext
 from dataclasses import dataclass
+import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Iterable
 
-from .config import AppConfig, GeneratorConfig, PROJECT_ROOT
+from .accuracy import (
+    GroundTruthConfig,
+    compute_ground_truth,
+    load_window_totals,
+    save_accuracy_evidence,
+)
+from .config import (
+    AppConfig,
+    GeneratorConfig,
+    PROJECT_ROOT,
+    watermark_seconds_text,
+)
 from .database import ExperimentStore
-from .generator import execute, prepare_environment, timestamp_id, utc_timestamp
+from .generator import Execution, execute, prepare_environment, timestamp_id, utc_timestamp
 from .kafka import KafkaAdmin, balance_cv, partition_deltas
 from .spark import SparkPipeline, SparkPipelineError
 
@@ -51,11 +64,26 @@ RESULT_FIELDS = (
     "spark_run_id",
     "spark_query_id",
     "spark_checkpoint_location",
+    "watermark_delay_seconds",
     "spark_baseline_batch_id",
     "spark_final_batch_id",
     "spark_processed_offsets",
     "spark_status",
     "spark_error",
+    "checkpoint_before_spark_run_id",
+    "checkpoint_after_spark_run_id",
+    "checkpoint_query_id_preserved",
+    "checkpoint_spark_run_changed",
+    "checkpoint_reused",
+    "checkpoint_backlog_event_count",
+    "checkpoint_offsets_recovered",
+    "checkpoint_identity_verified",
+    "checkpoint_no_loss_no_duplicates",
+    "ground_truth_status",
+    "ground_truth_manifest_sha256",
+    "ground_truth_event_count",
+    "ground_truth_window_count",
+    "ground_truth_error",
     "log_file",
 )
 
@@ -65,6 +93,17 @@ class Scenario:
     name: str
     generator: GeneratorConfig
     require_all_partitions: bool = False
+    watermark_delay_seconds: float | None = None
+    checkpoint_recovery: bool = False
+
+    def as_configuration(self) -> dict[str, object]:
+        return {
+            **self.generator.as_dict(),
+            "scenario": self.name,
+            "require_all_partitions": self.require_all_partitions,
+            "watermark_delay_seconds": self.watermark_delay_seconds,
+            "checkpoint_recovery": self.checkpoint_recovery,
+        }
 
 
 @dataclass(frozen=True)
@@ -72,6 +111,7 @@ class ExperimentPlan:
     experiment_type: str
     scenarios: tuple[Scenario, ...]
     export_csv: bool = True
+    managed_spark: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,7 +144,7 @@ def rate_plan(config: AppConfig) -> ExperimentPlan:
         )
         for index, rate in enumerate(config.experiments.rates, start=1)
     )
-    return ExperimentPlan("rate", scenarios)
+    return ExperimentPlan("rate", scenarios, managed_spark=True)
 
 
 def late_ratio_plan(config: AppConfig) -> ExperimentPlan:
@@ -123,7 +163,20 @@ def late_ratio_plan(config: AppConfig) -> ExperimentPlan:
             start=1,
         )
     )
-    return ExperimentPlan("late_ratio", scenarios)
+    return ExperimentPlan("late_ratio", scenarios, managed_spark=True)
+
+
+def watermark_plan(config: AppConfig) -> ExperimentPlan:
+    topic = config.generator.resolved_topic
+    scenarios = tuple(
+        Scenario(
+            f"watermark-{watermark_seconds_text(watermark).replace('.', '-')}s",
+            config.generator.with_changes(topic=topic),
+            watermark_delay_seconds=watermark,
+        )
+        for watermark in dict.fromkeys(config.experiments.watermarks)
+    )
+    return ExperimentPlan("watermark", scenarios, managed_spark=True)
 
 
 def partition_plan(config: AppConfig) -> ExperimentPlan:
@@ -138,7 +191,24 @@ def partition_plan(config: AppConfig) -> ExperimentPlan:
         )
         for count in dict.fromkeys(config.experiments.partitions)
     )
-    return ExperimentPlan("partition", scenarios)
+    return ExperimentPlan("partition", scenarios, managed_spark=True)
+
+
+def checkpoint_plan(config: AppConfig) -> ExperimentPlan:
+    """Exercise one checkpoint across a real Spark stop/start boundary.
+
+    Late events are disabled deliberately so a missing row cannot be confused
+    with an event-time watermark decision. Each phase uses a different seed.
+    """
+    generator = config.generator.with_changes(
+        topic=config.generator.resolved_topic,
+        late_ratio=0,
+    )
+    return ExperimentPlan(
+        "checkpoint",
+        (Scenario("checkpoint-restart", generator, checkpoint_recovery=True),),
+        managed_spark=True,
+    )
 
 
 class ExperimentRunner:
@@ -158,7 +228,6 @@ class ExperimentRunner:
         self.store.prepare()
         self._ensure_topics(plan.scenarios)
 
-        managed_spark = plan.experiment_type == "partition"
         run_stamp = timestamp_id()
         run_id = self.store.create_run(
             experiment_type=plan.experiment_type,
@@ -166,22 +235,63 @@ class ExperimentRunner:
             started_at=utc_timestamp(),
             configuration={
                 "experiment_type": plan.experiment_type,
-                "managed_spark": managed_spark,
+                "managed_spark": plan.managed_spark,
                 "spark_startup_timeout_seconds": self.config.runtime.spark_startup_timeout_seconds,
                 "spark_drain_timeout_seconds": self.config.runtime.spark_drain_timeout_seconds,
                 "scenarios": [
-                    scenario.generator.as_dict() for scenario in plan.scenarios
+                    scenario.as_configuration() for scenario in plan.scenarios
                 ],
             },
         )
 
         results: list[dict[str, object]] = []
         try:
-            with self.spark.session() if managed_spark else nullcontext():
+            with self.spark.session() if plan.managed_spark else nullcontext():
                 for sequence, scenario in enumerate(plan.scenarios, start=1):
-                    result, output = self._run_scenario(
-                        scenario, run_stamp, run_id if managed_spark else None
+                    result, output, evidence = self._run_scenario(
+                        scenario, run_stamp, run_id if plan.managed_spark else None
                     )
+                    if evidence is not None:
+                        evidence_config, events, digest = evidence
+                        try:
+                            result["ground_truth_window_count"] = save_accuracy_evidence(
+                                self.store,
+                                evidence_config,
+                                events,
+                                digest,
+                            )
+                            if scenario.checkpoint_recovery:
+                                totals = load_window_totals(
+                                    self.store,
+                                    run_id,
+                                    scenario.name,
+                                )
+                                no_loss = bool(
+                                    totals
+                                    and totals["total_expected_count"]
+                                        == totals["total_actual_count"]
+                                    and totals["total_missing_count"] == 0
+                                    and totals["total_extra_count"] == 0
+                                )
+                                result["checkpoint_accuracy_totals"] = totals
+                                result["checkpoint_no_loss_no_duplicates"] = no_loss
+                                recovery = dict(result["checkpoint_recovery"])
+                                recovery["no_loss_no_duplicates"] = no_loss
+                                result["checkpoint_recovery"] = recovery
+                                if not no_loss:
+                                    result.update(
+                                        status="failed",
+                                        spark_error=(
+                                            "checkpoint resumed but accuracy found "
+                                            "missing or duplicate events"
+                                        ),
+                                    )
+                        except Exception as exc:
+                            result.update(
+                                ground_truth_status="incomplete",
+                                ground_truth_error=f"database evidence write failed: {exc}",
+                                status="failed",
+                            )
                     results.append(result)
                     self.store.save_scenario(
                         run_id=run_id,
@@ -218,46 +328,489 @@ class ExperimentRunner:
         scenario: Scenario,
         run_stamp: str,
         experiment_run_id: str | None = None,
-    ) -> tuple[dict[str, object], str]:
+    ) -> tuple[
+        dict[str, object],
+        str,
+        tuple[GroundTruthConfig, tuple[dict[str, object], ...], str] | None,
+    ]:
+        if scenario.checkpoint_recovery:
+            if experiment_run_id is None:
+                raise SparkPipelineError(
+                    "Checkpoint recovery requires a managed Spark experiment."
+                )
+            return self._run_checkpoint_recovery(
+                scenario,
+                run_stamp,
+                experiment_run_id,
+            )
+
         generator = scenario.generator
         topic = generator.resolved_topic
+        watermark = (
+            f", watermark={scenario.watermark_delay_seconds:g}s"
+            if scenario.watermark_delay_seconds is not None
+            else ""
+        )
         print(
             f"\n=== {scenario.name}: topic={topic}, "
             f"partitions={generator.partitions}, rate={generator.rate:g}/s, "
-            f"late={generator.late_ratio:.1%} ===",
+            f"late={generator.late_ratio:.1%}{watermark} ===",
             flush=True,
         )
         before = self.kafka.offsets(topic)
-        context = (self.spark.scenario(topic, experiment_run_id)
+        context = (self.spark.scenario(
+                       topic,
+                       experiment_run_id,
+                       scenario_name=scenario.name,
+                       watermark_delay_seconds=scenario.watermark_delay_seconds,
+                   )
                    if experiment_run_id else nullcontext(None))
         if experiment_run_id:
             self._validate_offsets(before, generator.partitions)
-        with context as pipeline:
-            ready = None
-            if pipeline:
-                print(f"Waiting for Spark to read {topic} before producing...", flush=True)
-                ready = self.spark.wait_for_offsets(pipeline, before, startup=True)
-            result, output = self._produce_scenario(scenario, run_stamp, before)
-            if pipeline:
-                result.update(
-                    spark_run_id=ready["spark_run_id"],
-                    spark_query_id=ready["query_id"],
-                    spark_checkpoint_location=pipeline.checkpoint,
-                    spark_baseline_batch_id=ready["batch_id"],
+        result: dict[str, object] | None = None
+        execution = None
+        output = ""
+        try:
+            with context as pipeline:
+                ready = None
+                if pipeline:
+                    print(f"Waiting for Spark to read {topic} before producing...", flush=True)
+                    ready = self.spark.wait_for_offsets(pipeline, before, startup=True)
+                    self._validate_watermark(scenario, ready)
+                result, output, execution = self._produce_scenario(
+                    scenario,
+                    run_stamp,
+                    before,
                 )
+                if pipeline:
+                    result.update(
+                        spark_run_id=ready["spark_run_id"],
+                        spark_query_id=ready["query_id"],
+                        spark_checkpoint_location=pipeline.checkpoint,
+                        watermark_delay_seconds=ready["watermark_delay_seconds"],
+                        spark_baseline_batch_id=ready["batch_id"],
+                    )
+                    try:
+                        target = result["kafka_end_offsets"]
+                        self._validate_offsets(target, generator.partitions)
+                        print(f"Waiting for Spark to finish {topic}: offsets={target}...", flush=True)
+                        processed = self.spark.wait_for_offsets(pipeline, target)
+                        result["spark_processed_offsets"] = processed["end_offsets"]
+                        result["spark_final_batch_id"] = processed["batch_id"]
+                        result["spark_status"] = "passed"
+                    except SparkPipelineError as exc:
+                        result.update(
+                            spark_status="failed",
+                            spark_error=str(exc),
+                            status="failed",
+                        )
+                        print(f"Spark scenario failed: {exc}", flush=True)
+                    result["finished_at_utc"] = utc_timestamp()
+        except SparkPipelineError as exc:
+            # Preserve the generator result and Spark IDs if cleanup discovers
+            # a crashed driver after the scenario already produced its events.
+            if result is None:
+                raise
+            previous = result.get("spark_error")
+            detail = str(exc)
+            if previous and detail not in str(previous):
+                detail = f"{previous}; cleanup: {detail}"
+            result.update(
+                spark_status="failed",
+                spark_error=detail,
+                status="failed",
+                finished_at_utc=utc_timestamp(),
+            )
+            print(f"Spark scenario failed during cleanup: {exc}", flush=True)
+        assert result is not None
+        evidence = None
+        if pipeline is not None and execution is not None:
+            result.update(
+                ground_truth_status=execution.manifest_status,
+                ground_truth_manifest_sha256=execution.manifest_sha256,
+                ground_truth_event_count=len(execution.delivered_events),
+                ground_truth_window_count=0,
+                ground_truth_error=execution.manifest_error,
+            )
+            if execution.manifest_status == "incomplete":
+                result["status"] = "failed"
+            elif (
+                execution.manifest_status == "complete"
+                and execution.manifest_sha256 is not None
+            ):
                 try:
-                    target = result["kafka_end_offsets"]
-                    self._validate_offsets(target, generator.partitions)
-                    print(f"Waiting for Spark to finish {topic}: offsets={target}...", flush=True)
-                    processed = self.spark.wait_for_offsets(pipeline, target)
-                    result["spark_processed_offsets"] = processed["end_offsets"]
-                    result["spark_final_batch_id"] = processed["batch_id"]
-                    result["spark_status"] = "passed"
-                except SparkPipelineError as exc:
-                    result.update(spark_status="failed", spark_error=str(exc), status="failed")
-                    print(f"Spark scenario failed: {exc}", flush=True)
-                result["finished_at_utc"] = utc_timestamp()
-            return result, output
+                    window_duration = float(ready["window_duration_seconds"])
+                    watermark_delay = float(ready["watermark_delay_seconds"])
+                    evidence_config = GroundTruthConfig(
+                        run_id=experiment_run_id,
+                        scenario_name=scenario.name,
+                        topic=topic,
+                        watermark_delay_seconds=watermark_delay,
+                        window_duration_seconds=window_duration,
+                    )
+                    result["ground_truth_window_count"] = len(
+                        compute_ground_truth(
+                            evidence_config,
+                            execution.delivered_events,
+                        )
+                    )
+                    evidence = (
+                        evidence_config,
+                        execution.delivered_events,
+                        execution.manifest_sha256,
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    result.update(
+                        ground_truth_status="incomplete",
+                        ground_truth_error=f"ground truth calculation failed: {exc}",
+                        status="failed",
+                    )
+        else:
+            result.update(
+                ground_truth_status="unavailable",
+                ground_truth_manifest_sha256=None,
+                ground_truth_event_count=None,
+                ground_truth_window_count=None,
+                ground_truth_error=None,
+            )
+        return result, output, evidence
+
+    def _run_checkpoint_recovery(
+        self,
+        scenario: Scenario,
+        run_stamp: str,
+        experiment_run_id: str,
+    ) -> tuple[
+        dict[str, object],
+        str,
+        tuple[GroundTruthConfig, tuple[dict[str, object], ...], str] | None,
+    ]:
+        """Produce before and during downtime, then resume one checkpoint."""
+        generator = scenario.generator
+        topic = generator.resolved_topic
+        initial_offsets = self.kafka.offsets(topic)
+        self._validate_offsets(initial_offsets, generator.partitions)
+        started_at = utc_timestamp()
+        print(
+            f"\n=== {scenario.name}: checkpoint stop/restart, topic={topic}, "
+            f"partitions={generator.partitions}, rate={generator.rate:g}/s ===",
+            flush=True,
+        )
+
+        before_phase = Scenario(
+            f"{scenario.name}-before-stop",
+            generator,
+        )
+        with self.spark.scenario(
+            topic,
+            experiment_run_id,
+            scenario_name=scenario.name,
+        ) as before_pipeline:
+            print("Waiting for the first Spark run before producing...", flush=True)
+            before_ready = self.spark.wait_for_offsets(
+                before_pipeline,
+                initial_offsets,
+                startup=True,
+            )
+            before_result, before_output, before_execution = self._produce_scenario(
+                before_phase,
+                run_stamp,
+                initial_offsets,
+            )
+            before_stop_offsets = before_result["kafka_end_offsets"]
+            print(
+                f"Draining the first Spark run to offsets={before_stop_offsets}...",
+                flush=True,
+            )
+            before_processed = self.spark.wait_for_offsets(
+                before_pipeline,
+                before_stop_offsets,
+            )
+            checkpoint_location = before_pipeline.checkpoint
+
+        downtime_generator = generator.with_changes(seed=generator.seed + 1)
+        downtime_phase = Scenario(
+            f"{scenario.name}-while-stopped",
+            downtime_generator,
+        )
+        print("Spark is stopped; producing the recovery backlog...", flush=True)
+        downtime_result, downtime_output, downtime_execution = self._produce_scenario(
+            downtime_phase,
+            run_stamp,
+            before_stop_offsets,
+        )
+        downtime_end_offsets = downtime_result["kafka_end_offsets"]
+
+        print("Restarting Spark from the same checkpoint...", flush=True)
+        with self.spark.scenario(
+            topic,
+            experiment_run_id,
+            scenario_name=scenario.name,
+            checkpoint_location=checkpoint_location,
+        ) as after_pipeline:
+            after_ready = self.spark.wait_for_offsets(
+                after_pipeline,
+                before_stop_offsets,
+                startup=True,
+            )
+            after_processed = self.spark.wait_for_offsets(
+                after_pipeline,
+                downtime_end_offsets,
+            )
+
+        before_run_id = str(before_processed["spark_run_id"])
+        after_run_id = str(after_processed["spark_run_id"])
+        before_query_id = str(before_processed["query_id"])
+        after_query_id = str(after_processed["query_id"])
+        query_id_preserved = before_query_id == after_query_id
+        spark_run_changed = before_run_id != after_run_id
+        checkpoint_reused = checkpoint_location == after_pipeline.checkpoint
+        recovered_offsets = {
+            int(partition): int(offset)
+            for partition, offset in after_processed["end_offsets"].items()
+        }
+        target_offsets = {
+            int(partition): int(offset)
+            for partition, offset in downtime_end_offsets.items()
+        }
+        offsets_recovered = self._offsets_reached(
+            recovered_offsets,
+            target_offsets,
+        )
+        backlog_counts = partition_deltas(
+            before_stop_offsets,
+            downtime_end_offsets,
+            generator.partitions,
+        )
+        backlog_event_count = sum(backlog_counts.values())
+        recovery_verified = all((
+            query_id_preserved,
+            spark_run_changed,
+            checkpoint_reused,
+            offsets_recovered,
+            backlog_event_count > 0,
+        ))
+
+        execution = self._combine_executions(
+            before_execution,
+            downtime_execution,
+        )
+        final_offsets = {
+            int(partition): int(offset)
+            for partition, offset in downtime_end_offsets.items()
+        }
+        total_counts = partition_deltas(
+            initial_offsets,
+            final_offsets,
+            generator.partitions,
+        )
+        offset_event_count = sum(total_counts.values())
+        active_partitions = sum(count > 0 for count in total_counts.values())
+        all_partitions_active = active_partitions == generator.partitions
+        combined_metrics = self._metrics(
+            execution.return_code,
+            execution.summary,
+            generator.rate,
+            offset_event_count,
+            all_partitions_active,
+            scenario.require_all_partitions,
+        )
+        if not recovery_verified:
+            combined_metrics["status"] = "failed"
+
+        finished_at = utc_timestamp()
+        result: dict[str, object] = {
+            "scenario": scenario.name,
+            "topic": topic,
+            "partition_count": generator.partitions,
+            "active_partitions": active_partitions,
+            "partition_event_counts": total_counts,
+            "offset_event_count": offset_event_count,
+            "kafka_start_offsets": initial_offsets,
+            "kafka_end_offsets": final_offsets,
+            "all_partitions_active": all_partitions_active,
+            "partition_balance_cv_percent": balance_cv(total_counts),
+            "started_at_utc": started_at,
+            "finished_at_utc": finished_at,
+            "generator_finished_at_utc": downtime_result["finished_at_utc"],
+            "target_rate_events_s": generator.rate,
+            "duration_seconds": generator.duration_seconds * 2,
+            "expected_events": round(generator.rate * generator.duration_seconds) * 2,
+            "target_late_ratio_percent": 0,
+            "late_delay_seconds": generator.late_delay_seconds,
+            "seed": generator.seed,
+            "log_file": "",
+            "spark_run_id": after_run_id,
+            "spark_query_id": after_query_id,
+            "spark_checkpoint_location": after_pipeline.checkpoint,
+            "watermark_delay_seconds": after_processed["watermark_delay_seconds"],
+            # The second Spark run is new, so include every committed batch from it.
+            "spark_baseline_batch_id": -1,
+            "spark_final_batch_id": after_processed["batch_id"],
+            "spark_processed_offsets": recovered_offsets,
+            "spark_status": "passed" if offsets_recovered else "failed",
+            "spark_error": None if recovery_verified else (
+                "checkpoint identity or backlog recovery invariant failed"
+            ),
+            "checkpoint_before_spark_run_id": before_run_id,
+            "checkpoint_after_spark_run_id": after_run_id,
+            "checkpoint_before_query_id": before_query_id,
+            "checkpoint_after_query_id": after_query_id,
+            "checkpoint_query_id_preserved": query_id_preserved,
+            "checkpoint_spark_run_changed": spark_run_changed,
+            "checkpoint_reused": checkpoint_reused,
+            "checkpoint_before_stop_offsets": before_stop_offsets,
+            "checkpoint_downtime_end_offsets": downtime_end_offsets,
+            "checkpoint_recovered_offsets": recovered_offsets,
+            "checkpoint_backlog_event_count": backlog_event_count,
+            "checkpoint_offsets_recovered": offsets_recovered,
+            "checkpoint_identity_verified": recovery_verified,
+            "checkpoint_phase1_delivered": before_result.get("delivered"),
+            "checkpoint_downtime_delivered": downtime_result.get("delivered"),
+        }
+        result.update(combined_metrics)
+        result["checkpoint_recovery"] = {
+            "before_spark_run_id": before_run_id,
+            "after_spark_run_id": after_run_id,
+            "before_query_id": before_query_id,
+            "after_query_id": after_query_id,
+            "checkpoint_location": after_pipeline.checkpoint,
+            "before_stop_offsets": before_stop_offsets,
+            "downtime_end_offsets": downtime_end_offsets,
+            "recovered_offsets": recovered_offsets,
+            "backlog_event_count": backlog_event_count,
+            "phase1_delivered": before_result.get("delivered"),
+            "downtime_delivered": downtime_result.get("delivered"),
+            "query_id_preserved": query_id_preserved,
+            "spark_run_changed": spark_run_changed,
+            "checkpoint_reused": checkpoint_reused,
+            "offsets_recovered": offsets_recovered,
+            "identity_status": "passed" if recovery_verified else "failed",
+        }
+
+        result.update(
+            ground_truth_status=execution.manifest_status,
+            ground_truth_manifest_sha256=execution.manifest_sha256,
+            ground_truth_event_count=len(execution.delivered_events),
+            ground_truth_window_count=0,
+            ground_truth_error=execution.manifest_error,
+        )
+        evidence = None
+        if execution.manifest_status != "complete":
+            result["status"] = "failed"
+        elif execution.manifest_sha256 is not None:
+            try:
+                evidence_config = GroundTruthConfig(
+                    run_id=experiment_run_id,
+                    scenario_name=scenario.name,
+                    topic=topic,
+                    watermark_delay_seconds=float(
+                        after_processed["watermark_delay_seconds"]
+                    ),
+                    window_duration_seconds=float(
+                        after_processed["window_duration_seconds"]
+                    ),
+                )
+                result["ground_truth_window_count"] = len(
+                    compute_ground_truth(
+                        evidence_config,
+                        execution.delivered_events,
+                    )
+                )
+                evidence = (
+                    evidence_config,
+                    execution.delivered_events,
+                    execution.manifest_sha256,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                result.update(
+                    ground_truth_status="incomplete",
+                    ground_truth_error=f"ground truth calculation failed: {exc}",
+                    status="failed",
+                )
+
+        output = (
+            "=== before Spark stop ===\n" + before_output
+            + "\n=== while Spark stopped ===\n" + downtime_output
+        )
+        return result, output, evidence
+
+    @staticmethod
+    def _offsets_reached(
+        observed: dict[int, int],
+        target: dict[int, int],
+    ) -> bool:
+        return set(observed) == set(target) and all(
+            observed[partition] >= offset
+            for partition, offset in target.items()
+        )
+
+    @staticmethod
+    def _combine_executions(first: Execution, second: Execution) -> Execution:
+        summaries = (first.summary, second.summary)
+        if any(summary is None for summary in summaries):
+            summary = None
+        else:
+            complete = [summary for summary in summaries if summary is not None]
+            elapsed = sum(float(summary["elapsed"]) for summary in complete)
+            delivered = sum(int(summary["delivered"]) for summary in complete)
+            summary = {
+                "attempted": str(sum(int(item["attempted"]) for item in complete)),
+                "delivered": str(delivered),
+                "failed": str(sum(int(item["failed"]) for item in complete)),
+                "late": str(sum(int(item["late"]) for item in complete)),
+                "remaining": str(sum(int(item["remaining"]) for item in complete)),
+                "elapsed": f"{elapsed:.3f}",
+                "delivered_rate": f"{(delivered / elapsed if elapsed else 0):.3f}",
+            }
+
+        events = first.delivered_events + second.delivered_events
+        manifest_bytes = b"".join(
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+            for event in events
+        )
+        manifest_status = (
+            "complete"
+            if first.manifest_status == second.manifest_status == "complete"
+            else "incomplete"
+        )
+        errors = [
+            error for error in (first.manifest_error, second.manifest_error) if error
+        ]
+        return Execution(
+            max(first.return_code, second.return_code),
+            first.output + "\n" + second.output,
+            summary,
+            events,
+            hashlib.sha256(manifest_bytes).hexdigest() if manifest_status == "complete" else None,
+            manifest_status,
+            "; ".join(errors) if errors else None,
+        )
+
+    @staticmethod
+    def _validate_watermark(
+        scenario: Scenario,
+        snapshot: dict[str, object],
+    ) -> None:
+        expected = scenario.watermark_delay_seconds
+        if expected is None:
+            return
+        actual = snapshot.get("watermark_delay_seconds")
+        try:
+            matches = actual is not None and math.isclose(
+                float(actual),
+                float(expected),
+                rel_tol=0,
+                abs_tol=0.0005,
+            )
+        except (TypeError, ValueError):
+            matches = False
+        if not matches:
+            raise SparkPipelineError(
+                f"Spark started with watermark={actual!r}s; "
+                f"scenario requires {expected:g}s."
+            )
 
     @staticmethod
     def _validate_offsets(offsets: dict[int, int], partitions: int) -> None:
@@ -266,7 +819,7 @@ class ExperimentRunner:
 
     def _produce_scenario(
         self, scenario: Scenario, run_stamp: str, before: dict[int, int],
-    ) -> tuple[dict[str, object], str]:
+    ) -> tuple[dict[str, object], str, Execution]:
         generator = scenario.generator
         topic = generator.resolved_topic
         started_at = utc_timestamp()
@@ -317,7 +870,9 @@ class ExperimentRunner:
                 scenario.require_all_partitions,
             )
         )
-        return result, execution.output
+        if execution.manifest_status == "incomplete":
+            result["status"] = "failed"
+        return result, execution.output, execution
 
     @staticmethod
     def _metrics(
@@ -368,9 +923,9 @@ class ExperimentRunner:
                 2,
             ) if attempted else 0.0,
             "actual_late_ratio_percent": round(
-                simulated_late / attempted * 100,
+                simulated_late / delivered * 100,
                 2,
-            ) if attempted else 0.0,
+            ) if delivered else 0.0,
             "offsets_match_delivery": offsets_match,
             "status": "passed" if passed else "failed",
         }

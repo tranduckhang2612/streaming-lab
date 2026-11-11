@@ -18,18 +18,84 @@ class SparkOrchestrationTests(unittest.TestCase):
     def test_each_scenario_overrides_topic_driver_and_shared_checkpoint(self):
         with patch.object(self.spark, "_command", return_value=SimpleNamespace(stdout="")) as command, \
                 patch.object(self.spark, "_state", return_value={"Running": True, "ExitCode": 0}), \
-                patch.dict(os.environ, {"SPARK_CHECKPOINT_LOCATION": "/shared-checkpoint"}):
+                patch.dict(os.environ, {
+                    "SPARK_CHECKPOINT_LOCATION": "/shared-checkpoint",
+                    "SPARK_WATERMARK": "45 seconds",
+                }):
             checkpoints = []
             for topic in ("events-p1", "events-p3"):
                 with self.spark.scenario(topic, "experiment-id") as pipeline:
                     checkpoints.append(pipeline.checkpoint)
                     invocation = command.call_args
                     self.assertEqual(invocation.kwargs["env"]["SPARK_INPUT_TOPIC"], topic)
+                    self.assertEqual(
+                        invocation.kwargs["env"]["SPARK_STARTING_OFFSETS"],
+                        "latest",
+                    )
                     self.assertEqual(invocation.kwargs["env"]["SPARK_DRIVER_HOST"], pipeline.container)
                     self.assertEqual(invocation.kwargs["env"]["SPARK_CHECKPOINT_LOCATION"], pipeline.checkpoint)
+                    self.assertEqual(invocation.kwargs["env"]["SPARK_WATERMARK"], "45 seconds")
+                    self.assertEqual(
+                        invocation.kwargs["env"]["SPARK_EXPERIMENT_RUN_ID"],
+                        "experiment-id",
+                    )
+                    self.assertEqual(
+                        invocation.kwargs["env"]["SPARK_EXPERIMENT_SCENARIO_NAME"],
+                        "scenario",
+                    )
                     self.assertNotEqual(pipeline.checkpoint, "/shared-checkpoint")
                     self.assertNotIn("--service-ports", invocation.args[0])
             self.assertNotEqual(*checkpoints)
+
+    def test_watermark_scenario_overrides_environment_and_accepts_zero(self):
+        with patch.object(self.spark, "_command", return_value=SimpleNamespace(stdout="")) as command, \
+                patch.object(self.spark, "_state", return_value={"Running": True, "ExitCode": 0}), \
+                patch.dict(os.environ, {"SPARK_WATERMARK": "99 seconds"}):
+            with self.spark.scenario(
+                "test-topic",
+                "experiment-id",
+                watermark_delay_seconds=0,
+            ) as pipeline:
+                invocation = command.call_args
+                self.assertEqual(
+                    invocation.kwargs["env"]["SPARK_WATERMARK"],
+                    "0 seconds",
+                )
+                self.assertEqual(pipeline.watermark_delay_seconds, 0)
+
+    def test_scenario_can_reuse_checkpoint_across_restart(self):
+        with patch.object(
+            self.spark,
+            "_command",
+            return_value=SimpleNamespace(stdout=""),
+        ) as command, patch.object(
+            self.spark,
+            "_state",
+            return_value={"Running": True, "ExitCode": 0},
+        ):
+            with self.spark.scenario(
+                "test-topic",
+                "experiment-id",
+                checkpoint_location="file:///shared/recovery-checkpoint",
+            ) as pipeline:
+                invocation = command.call_args
+                self.assertEqual(
+                    invocation.kwargs["env"]["SPARK_CHECKPOINT_LOCATION"],
+                    "file:///shared/recovery-checkpoint",
+                )
+                self.assertEqual(pipeline.checkpoint, "file:///shared/recovery-checkpoint")
+
+    def test_watermark_scenario_rejects_invalid_direct_values(self):
+        for value in (-1, float("nan"), float("inf"), True, 1.0001, 1_000_000_000):
+            with self.subTest(value=value), patch.object(self.spark, "_command") as command:
+                with self.assertRaisesRegex(SparkPipelineError, "watermark"):
+                    with self.spark.scenario(
+                        "test-topic",
+                        "experiment-id",
+                        watermark_delay_seconds=value,
+                    ):
+                        self.fail("Invalid watermark started a Spark scenario")
+                command.assert_not_called()
 
     def test_failure_cleans_up_own_job_and_restores_original_container(self):
         commands = []
@@ -79,6 +145,30 @@ class SparkOrchestrationTests(unittest.TestCase):
         self.assertEqual(result["end_offsets"], {"0": 0, "1": 0})
         self.assertEqual(self.store.pipeline_progress.call_count, 3)
         self.store.pipeline_progress.assert_called_with("/test/checkpoint", "test-topic")
+
+    def test_restart_startup_wait_ignores_previous_stopped_run(self):
+        self.store.pipeline_progress.side_effect = [
+            {
+                "effective_status": "stopped",
+                "end_offsets": {"0": 10},
+            },
+            {
+                "effective_status": "running",
+                "end_offsets": {"0": 10},
+            },
+        ]
+        with patch.object(
+            self.spark,
+            "_state",
+            return_value={"Running": True},
+        ), patch("app.spark.time.sleep"):
+            result = self.spark.wait_for_offsets(
+                self.pipeline,
+                {0: 10},
+                startup=True,
+            )
+        self.assertEqual(result["effective_status"], "running")
+        self.assertEqual(self.store.pipeline_progress.call_count, 2)
 
     def test_unresponsive_query_cannot_pass_even_with_sufficient_offsets(self):
         clock = [0]

@@ -419,7 +419,14 @@ WHERE spark_run_id = {sql_literal(spark_run_id)}::UUID
                     raise
                 time.sleep(1)
 
-    def save_window_results(self, rows: list[dict[str, Any]]) -> None:
+    def save_window_results(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        experiment_run_id: str | None = None,
+        scenario_name: str | None = None,
+        batch_id: int | None = None,
+    ) -> None:
         if not rows:
             return
 
@@ -443,7 +450,53 @@ WHERE spark_run_id = {sql_literal(spark_run_id)}::UUID
             )
 
         values_sql = ",\n".join(values_list)
-        sql = f"""
+        scenario_sql = ""
+        if experiment_run_id is not None and scenario_name is not None:
+            scenario_values = []
+            for r in rows:
+                scenario_values.append(
+                    f"("
+                    f"{sql_literal(experiment_run_id)}::UUID, "
+                    f"{sql_literal(scenario_name)}, "
+                    f"{sql_literal(r['topic'])}, "
+                    f"{sql_literal(r['window_start'])}, "
+                    f"{sql_literal(r['window_end'])}, "
+                    f"{sql_literal(r['merchant_category'])}, "
+                    f"{sql_literal(r['transaction_count'])}, "
+                    f"{sql_literal(r['total_amount_vnd'])}, "
+                    f"{sql_literal(r['average_amount_vnd'])}, "
+                    f"{sql_literal(r['min_amount_vnd'])}, "
+                    f"{sql_literal(r['max_amount_vnd'])}, "
+                    f"{sql_literal(r['simulated_late_count'])}, "
+                    f"{sql_literal(r['average_event_lateness_ms'])}, "
+                    f"{sql_literal(batch_id)}, CURRENT_TIMESTAMP)"
+                )
+            scenario_values_sql = ",\n".join(scenario_values)
+            scenario_sql = f"""
+INSERT INTO streaming.experiment_window_actuals (
+    experiment_run_id, scenario_name, topic, window_start, window_end,
+    merchant_category, actual_count, actual_total_amount_vnd,
+    actual_average_amount_vnd, actual_min_amount_vnd, actual_max_amount_vnd,
+    actual_simulated_late_count, actual_average_event_lateness_ms,
+    last_batch_id, updated_at
+) VALUES
+{scenario_values_sql}
+ON CONFLICT (
+    experiment_run_id, scenario_name, topic, window_start, window_end,
+    merchant_category
+) DO UPDATE SET
+    actual_count = EXCLUDED.actual_count,
+    actual_total_amount_vnd = EXCLUDED.actual_total_amount_vnd,
+    actual_average_amount_vnd = EXCLUDED.actual_average_amount_vnd,
+    actual_min_amount_vnd = EXCLUDED.actual_min_amount_vnd,
+    actual_max_amount_vnd = EXCLUDED.actual_max_amount_vnd,
+    actual_simulated_late_count = EXCLUDED.actual_simulated_late_count,
+    actual_average_event_lateness_ms = EXCLUDED.actual_average_event_lateness_ms,
+    last_batch_id = EXCLUDED.last_batch_id,
+    updated_at = CURRENT_TIMESTAMP;
+"""
+
+        global_sql = f"""
 INSERT INTO streaming.transaction_window_results (
     topic,
     window_start,
@@ -469,6 +522,11 @@ ON CONFLICT (topic, window_start, window_end, merchant_category) DO UPDATE SET
     average_event_lateness_ms = EXCLUDED.average_event_lateness_ms,
     updated_at = CURRENT_TIMESTAMP;
 """
+        sql = (
+            f"BEGIN;\n{global_sql}\n{scenario_sql}\nCOMMIT;"
+            if scenario_sql
+            else global_sql
+        )
         self.execute(sql)
 
     def save_batch_metrics(
@@ -650,6 +708,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--window-duration", default="1 minute")
     parser.add_argument("--trigger-interval", default="5 seconds")
+    parser.add_argument("--experiment-run-id")
+    parser.add_argument("--experiment-scenario-name")
     parser.add_argument(
         "--starting-offsets",
         choices=("earliest", "latest"),
@@ -686,6 +746,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--max-future-skew-seconds must be non-negative")
     if not args.checkpoint_location:
         args.checkpoint_location = f"{DEFAULT_CHECKPOINT_ROOT}/{args.topic}"
+    args.experiment_run_id = args.experiment_run_id or None
+    args.experiment_scenario_name = args.experiment_scenario_name or None
+    if (args.experiment_run_id is None) != (args.experiment_scenario_name is None):
+        parser.error(
+            "--experiment-run-id and --experiment-scenario-name must be provided together"
+        )
     return args
 
 
@@ -934,7 +1000,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"[Batch {batch_id}] Upserting {len(rows)} window aggregations to PostgreSQL...",
                 flush=True,
             )
-            db_writer.save_window_results(rows)
+            db_writer.save_window_results(
+                rows,
+                experiment_run_id=args.experiment_run_id,
+                scenario_name=args.experiment_scenario_name,
+                batch_id=batch_id,
+            )
 
     query = (
         window_results.writeStream
@@ -975,6 +1046,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "trigger_interval": args.trigger_interval,
                 "checkpoint_location": args.checkpoint_location,
                 "starting_offsets": args.starting_offsets,
+                "experiment_run_id": args.experiment_run_id,
+                "experiment_scenario_name": args.experiment_scenario_name,
             },
         )
         wait_for_query(

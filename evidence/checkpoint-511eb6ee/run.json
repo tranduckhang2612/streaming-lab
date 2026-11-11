@@ -1,0 +1,173 @@
+{
+    "topic": "raw-events",
+    "run_id": "511eb6ee-90ac-4481-b6b1-5cfce79459fd",
+    "status": "passed",
+    "scenarios": [
+        {
+            "result": {
+                "seed": 42,
+                "topic": "raw-events",
+                "failed": 0,
+                "status": "passed",
+                "log_file": "",
+                "scenario": "checkpoint-restart",
+                "attempted": 50,
+                "delivered": 50,
+                "remaining": 0,
+                "spark_error": null,
+                "spark_run_id": "afc58e37-1586-4da4-9e82-2779ae2c0cdf",
+                "spark_status": "passed",
+                "simulated_late": 0,
+                "spark_query_id": "6900fa76-0d90-420e-91ca-0499abf0c29a",
+                "started_at_utc": "2026-11-11T00:55:35.009Z",
+                "elapsed_seconds": 10.0,
+                "expected_events": 50,
+                "finished_at_utc": "2026-11-11T00:57:08.273Z",
+                "partition_count": 3,
+                "duration_seconds": 10.0,
+                "active_partitions": 3,
+                "checkpoint_reused": true,
+                "kafka_end_offsets": {
+                    "0": 660,
+                    "1": 1303,
+                    "2": 1238
+                },
+                "ground_truth_error": null,
+                "late_delay_seconds": 45,
+                "offset_event_count": 50,
+                "checkpoint_recovery": {
+                    "after_query_id": "6900fa76-0d90-420e-91ca-0499abf0c29a",
+                    "before_query_id": "6900fa76-0d90-420e-91ca-0499abf0c29a",
+                    "identity_status": "passed",
+                    "phase1_delivered": 25,
+                    "checkpoint_reused": true,
+                    "offsets_recovered": true,
+                    "recovered_offsets": {
+                        "0": 660,
+                        "1": 1303,
+                        "2": 1238
+                    },
+                    "spark_run_changed": true,
+                    "after_spark_run_id": "afc58e37-1586-4da4-9e82-2779ae2c0cdf",
+                    "downtime_delivered": 25,
+                    "query_id_preserved": true,
+                    "backlog_event_count": 25,
+                    "before_spark_run_id": "26fe6b67-af05-42d9-8f3f-3c42c270578e",
+                    "before_stop_offsets": {
+                        "0": 655,
+                        "1": 1296,
+                        "2": 1225
+                    },
+                    "checkpoint_location": "file:///opt/spark/work-dir/checkpoints/experiments/511eb6ee-90ac-4481-b6b1-5cfce79459fd/bfd31842c2004b9fb9ee1d6a83d8af9e",
+                    "downtime_end_offsets": {
+                        "0": 660,
+                        "1": 1303,
+                        "2": 1238
+                    },
+                    "no_loss_no_duplicates": true
+                },
+                "ground_truth_status": "complete",
+                "kafka_start_offsets": {
+                    "0": 650,
+                    "1": 1287,
+                    "2": 1214
+                },
+                "spark_final_batch_id": 3,
+                "target_rate_events_s": 5.0,
+                "all_partitions_active": true,
+                "offsets_match_delivery": true,
+                "partition_event_counts": {
+                    "0": 10,
+                    "1": 16,
+                    "2": 24
+                },
+                "delivered_rate_events_s": 5.0,
+                "spark_baseline_batch_id": -1,
+                "spark_processed_offsets": {
+                    "0": 660,
+                    "1": 1303,
+                    "2": 1238
+                },
+                "watermark_delay_seconds": 30.0,
+                "delivery_success_percent": 100.0,
+                "ground_truth_event_count": 50,
+                "rate_achievement_percent": 100.0,
+                "actual_late_ratio_percent": 0.0,
+                "checkpoint_after_query_id": "6900fa76-0d90-420e-91ca-0499abf0c29a",
+                "generator_finished_at_utc": "2026-11-11T00:56:26.781Z",
+                "ground_truth_window_count": 5,
+                "spark_checkpoint_location": "file:///opt/spark/work-dir/checkpoints/experiments/511eb6ee-90ac-4481-b6b1-5cfce79459fd/bfd31842c2004b9fb9ee1d6a83d8af9e",
+                "target_late_ratio_percent": 0,
+                "checkpoint_accuracy_totals": {
+                    "total_extra_count": 0,
+                    "total_actual_count": 50,
+                    "total_missing_count": 0,
+                    "total_expected_count": 50
+                },
+                "checkpoint_before_query_id": "6900fa76-0d90-420e-91ca-0499abf0c29a",
+                "checkpoint_phase1_delivered": 25,
+                "checkpoint_identity_verified": true,
+                "checkpoint_offsets_recovered": true,
+                "checkpoint_recovered_offsets": {
+                    "0": 660,
+                    "1": 1303,
+                    "2": 1238
+                },
+                "checkpoint_spark_run_changed": true,
+                "ground_truth_manifest_sha256": "b573b5267466245ec142cdf27f5bb9fed05dcccc75d9589e2f17b0aeea342dba",
+                "partition_balance_cv_percent": 34.41,
+                "checkpoint_after_spark_run_id": "afc58e37-1586-4da4-9e82-2779ae2c0cdf",
+                "checkpoint_downtime_delivered": 25,
+                "checkpoint_query_id_preserved": true,
+                "checkpoint_backlog_event_count": 25,
+                "checkpoint_before_spark_run_id": "26fe6b67-af05-42d9-8f3f-3c42c270578e",
+                "checkpoint_before_stop_offsets": {
+                    "0": 655,
+                    "1": 1296,
+                    "2": 1225
+                },
+                "checkpoint_downtime_end_offsets": {
+                    "0": 660,
+                    "1": 1303,
+                    "2": 1238
+                },
+                "checkpoint_no_loss_no_duplicates": true
+            },
+            "status": "passed",
+            "spark_run_id": "afc58e37-1586-4da4-9e82-2779ae2c0cdf",
+            "scenario_name": "checkpoint-restart",
+            "spark_query_id": "6900fa76-0d90-420e-91ca-0499abf0c29a",
+            "sequence_number": 1,
+            "ground_truth_status": "complete"
+        }
+    ],
+    "started_at": "2026-11-11T07:55:31.315+07:00",
+    "finished_at": "2026-11-11T07:57:08.947+07:00",
+    "configuration": {
+        "scenarios": [
+            {
+                "rate": 5.0,
+                "seed": 42,
+                "topic": "raw-events",
+                "scenario": "checkpoint-restart",
+                "late_ratio": 0,
+                "partitions": 3,
+                "account_count": 100,
+                "max_amount_vnd": 5000000,
+                "merchant_count": 50,
+                "min_amount_vnd": 10000,
+                "resolved_topic": "raw-events",
+                "duration_seconds": 5.0,
+                "late_delay_seconds": 45,
+                "checkpoint_recovery": true,
+                "require_all_partitions": false,
+                "watermark_delay_seconds": null
+            }
+        ],
+        "managed_spark": true,
+        "experiment_type": "checkpoint",
+        "spark_drain_timeout_seconds": 120,
+        "spark_startup_timeout_seconds": 180
+    },
+    "experiment_type": "checkpoint"
+}

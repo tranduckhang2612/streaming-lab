@@ -1,4 +1,4 @@
-"""Run and drain one Spark query per partition scenario using Docker Compose."""
+"""Run and drain one isolated Spark query per experiment scenario."""
 
 from __future__ import annotations
 
@@ -12,7 +12,13 @@ import time
 from typing import Iterator
 from uuid import uuid4
 
-from .config import PROJECT_ROOT, RuntimeConfig
+from .config import (
+    PROJECT_ROOT,
+    ConfigError,
+    RuntimeConfig,
+    canonical_watermark_seconds,
+    watermark_seconds_text,
+)
 from .database import ExperimentStore
 
 
@@ -25,6 +31,9 @@ class SparkRun:
     container: str
     topic: str
     checkpoint: str
+    experiment_run_id: str | None = None
+    scenario_name: str | None = None
+    watermark_delay_seconds: float | None = None
 
 
 class SparkPipeline:
@@ -59,7 +68,7 @@ class SparkPipeline:
             regular.append(container)
         try:
             if regular:
-                print("Pausing the regular Spark job for the partition experiment...", flush=True)
+                print("Pausing the regular Spark job for the experiment...", flush=True)
                 self._command(["docker", "stop", "--time", "60", *regular])
             yield
         finally:
@@ -68,20 +77,55 @@ class SparkPipeline:
                 self._command(["docker", "start", *regular])
 
     @contextmanager
-    def scenario(self, topic: str, experiment_run_id: str) -> Iterator[SparkRun]:
+    def scenario(
+        self,
+        topic: str,
+        experiment_run_id: str,
+        *,
+        scenario_name: str = "scenario",
+        watermark_delay_seconds: float | None = None,
+        checkpoint_location: str | None = None,
+        starting_offsets: str = "latest",
+    ) -> Iterator[SparkRun]:
+        if watermark_delay_seconds is not None:
+            try:
+                watermark_delay_seconds = canonical_watermark_seconds(
+                    watermark_delay_seconds
+                )
+            except ConfigError as exc:
+                raise SparkPipelineError(str(exc)) from exc
+        if checkpoint_location is not None and not checkpoint_location.strip():
+            raise SparkPipelineError("checkpoint_location cannot be empty")
+        if starting_offsets not in ("earliest", "latest"):
+            raise SparkPipelineError(
+                "starting_offsets must be either 'earliest' or 'latest'"
+            )
         token = uuid4().hex
         pipeline = SparkRun(
-            container=f"streaming-partition-{token[:16]}",
+            container=f"streaming-experiment-{token[:16]}",
             topic=topic,
-            checkpoint=("file:///opt/spark/work-dir/checkpoints/partition-experiments/"
-                        f"{experiment_run_id}/{token}"),
+            checkpoint=(
+                checkpoint_location
+                or "file:///opt/spark/work-dir/checkpoints/experiments/"
+                   f"{experiment_run_id}/{token}"
+            ),
+            experiment_run_id=experiment_run_id,
+            scenario_name=scenario_name,
+            watermark_delay_seconds=watermark_delay_seconds,
         )
         env = dict(os.environ)
         env.update(
             SPARK_INPUT_TOPIC=topic,
+            SPARK_STARTING_OFFSETS=starting_offsets,
             SPARK_CHECKPOINT_LOCATION=pipeline.checkpoint,
             SPARK_DRIVER_HOST=pipeline.container,
+            SPARK_EXPERIMENT_RUN_ID=experiment_run_id,
+            SPARK_EXPERIMENT_SCENARIO_NAME=scenario_name,
         )
+        if watermark_delay_seconds is not None:
+            env["SPARK_WATERMARK"] = (
+                f"{watermark_seconds_text(watermark_delay_seconds)} seconds"
+            )
         try:
             self._command([
                 "docker", "compose", "--profile", "streaming", "run", "-d", "-T",
@@ -125,8 +169,20 @@ class SparkPipeline:
             if snapshot:
                 status = snapshot["effective_status"]
                 if status in ("stopped", "failed", "superseded"):
-                    raise SparkPipelineError(f"Spark run for {pipeline.topic} is {status}.")
-                offsets = {int(p): offset for p, offset in snapshot["end_offsets"].items()}
+                    # A restarted query reuses the checkpoint. Until the new
+                    # driver records its run, the latest database row still
+                    # belongs to the previous, intentionally stopped driver.
+                    if not startup:
+                        raise SparkPipelineError(
+                            f"Spark run for {pipeline.topic} is {status}."
+                        )
+                    snapshot = None
+                    offsets = {}
+                else:
+                    offsets = {
+                        int(p): offset
+                        for p, offset in snapshot["end_offsets"].items()
+                    }
                 if status == "running" and target and all(
                     offsets.get(p, -1) >= end for p, end in target.items()
                 ):

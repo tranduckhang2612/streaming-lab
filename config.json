@@ -15,6 +15,7 @@
   "experiments": {
     "rates": [10, 100, 500],
     "late_ratios": [0, 0.1, 0.3],
+    "watermarks": [10, 30, 60],
     "partitions": [1, 3, 6],
     "topic_prefix": "raw-events-p",
     "results_dir": "results",

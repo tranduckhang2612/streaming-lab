@@ -1,0 +1,628 @@
+{
+  "uid": "streaming-experiment-evidence",
+  "title": "Streaming Experiment Evidence",
+  "description": "Minh chứng có thể tái tạo cho watermark, partition, rate, late ratio và checkpoint recovery. Mọi panel được cô lập theo experiment run và scenario.",
+  "tags": [
+    "streaming",
+    "experiment",
+    "evidence"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "experiment_run_id",
+        "label": "Experiment run",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "postgres-streaming"
+        },
+        "query": "SELECT r.run_id::text AS __value, r.experiment_type || ' | ' || r.topic || ' | ' || r.status || ' | ' || to_char(r.started_at AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS') AS __text\nFROM streaming.experiment_runs r\nWHERE EXISTS (SELECT 1 FROM streaming.experiment_scenarios s WHERE s.run_id = r.run_id AND s.ground_truth_status <> 'unavailable')\nORDER BY r.started_at DESC",
+        "definition": "SELECT r.run_id::text AS __value, r.experiment_type || ' | ' || r.topic || ' | ' || r.status || ' | ' || to_char(r.started_at AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS') AS __text FROM streaming.experiment_runs r WHERE EXISTS (SELECT 1 FROM streaming.experiment_scenarios s WHERE s.run_id = r.run_id AND s.ground_truth_status <> 'unavailable') ORDER BY r.started_at DESC",
+        "refresh": 2,
+        "multi": false,
+        "includeAll": false,
+        "current": {},
+        "sort": 0
+      },
+      {
+        "name": "scenario_name",
+        "label": "Scenario",
+        "type": "query",
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "postgres-streaming"
+        },
+        "query": "SELECT scenario_name AS __value, scenario_name AS __text\nFROM streaming.experiment_scenarios\nWHERE run_id::text = '$experiment_run_id'\nORDER BY sequence_number",
+        "definition": "SELECT scenario_name AS __value, scenario_name AS __text FROM streaming.experiment_scenarios WHERE run_id::text = '$experiment_run_id' ORDER BY sequence_number",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "bargauge",
+      "title": "Count accuracy theo scenario",
+      "description": "Intersection/union giữa ground truth của event Kafka đã ACK và Spark actual. Missing và extra đều làm giảm điểm; NULL nghĩa là evidence chưa hoàn chỉnh.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_name AS metric, overall_count_accuracy_percent AS value\nFROM streaming.experiment_scenario_accuracy\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 95
+              },
+              {
+                "color": "green",
+                "value": 99
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color"
+      }
+    },
+    {
+      "id": 2,
+      "type": "bargauge",
+      "title": "Amount accuracy theo scenario",
+      "description": "So sánh tổng amount theo full set window/category; công thức đối xứng nên amount thừa cũng bị trừ điểm.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 7
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_name AS metric, overall_amount_accuracy_percent AS value\nFROM streaming.experiment_scenario_accuracy\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 95
+              },
+              {
+                "color": "green",
+                "value": 99
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color"
+      }
+    },
+    {
+      "id": 3,
+      "type": "barchart",
+      "title": "Missing / extra events",
+      "description": "Missing là event thuộc ground truth nhưng không có trong Spark output; extra là Spark output vượt ground truth.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_name, total_missing_count AS missing, total_extra_count AS extra\nFROM streaming.experiment_scenario_accuracy\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "missing"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "extra"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "auto",
+        "showValue": "always",
+        "stacking": "normal",
+        "groupWidth": 0.7,
+        "barWidth": 0.8,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "barchart",
+      "title": "Late events accepted / dropped",
+      "description": "Late accepted/dropped được suy ra từ ground truth và actual của cùng scenario, không dự đoán chỉ từ late_delay <= watermark.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 7,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_name, total_late_events_accepted AS accepted, total_late_events_dropped AS dropped\nFROM streaming.experiment_scenario_accuracy\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "showValue": "always",
+        "stacking": "normal",
+        "groupWidth": 0.7,
+        "barWidth": 0.8,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "barchart",
+      "title": "Throughput theo scenario",
+      "description": "Target generator, tốc độ delivery thực tế và Spark processed rows/s trung bình trong đúng batch bounds của scenario.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_name, target_rate_events_s AS target, delivered_rate_events_s AS delivered, ROUND(avg_processed_rows_per_second, 3) AS spark_processed\nFROM streaming.experiment_scenario_metrics\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:rows/s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "showValue": "always",
+        "stacking": "off",
+        "groupWidth": 0.7,
+        "barWidth": 0.8,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "bargauge",
+      "title": "p95 end-to-end latency theo scenario",
+      "description": "Giá trị lớn nhất của p95 micro-batch trong scenario; đây không phải p95 gộp của toàn bộ event.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 15,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_name AS metric, max_batch_p95_latency_ms AS value\nFROM streaming.experiment_scenario_metrics\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color"
+      }
+    },
+    {
+      "id": 7,
+      "type": "barchart",
+      "title": "Consumer lag theo scenario",
+      "description": "Lag lớn nhất quan sát được trong đúng batch bounds của mỗi scenario.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_name, max_total_consumer_lag AS total_lag, max_partition_lag AS max_partition_lag\nFROM streaming.experiment_scenario_metrics\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "suffix:records"
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "showValue": "always",
+        "stacking": "off",
+        "groupWidth": 0.7,
+        "barWidth": 0.8,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "bargauge",
+      "title": "p95 checkpoint commit theo scenario",
+      "description": "p95 của checkpoint commit time trên các micro-batch đo được trong scenario.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_name AS metric, p95_checkpoint_commit_ms AS value\nFROM streaming.experiment_scenario_metrics\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color"
+      }
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Bảng so sánh scenario đầy đủ",
+      "description": "Một dòng cho mỗi scenario: biến kiểm soát, runtime metric, accuracy và trạng thái completeness.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 11
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT m.sequence_number, m.scenario_name, m.experiment_type, m.topic,\n  m.partition_count, m.active_partitions, m.watermark_delay_seconds,\n  m.target_rate_events_s, m.delivered_rate_events_s,\n  ROUND(m.avg_processed_rows_per_second, 3) AS avg_processed_rows_per_second,\n  m.max_total_consumer_lag, m.max_partition_lag,\n  ROUND(m.max_batch_p95_latency_ms, 3) AS max_batch_p95_latency_ms,\n  ROUND(m.p95_checkpoint_commit_ms::numeric, 3) AS p95_checkpoint_commit_ms,\n  m.rows_dropped_by_watermark,\n  a.total_expected_count, a.total_actual_count,\n  a.total_missing_count, a.total_extra_count,\n  a.overall_count_accuracy_percent, a.overall_amount_accuracy_percent,\n  a.total_late_events_accepted, a.total_late_events_dropped,\n  a.ground_truth_manifest_sha256, a.accuracy_complete,\n  m.metrics_bounds_complete, m.spark_status, m.pipeline_effective_status,\n  m.scenario_status\nFROM streaming.experiment_scenario_metrics m\nLEFT JOIN streaming.experiment_scenario_accuracy a\n  ON a.experiment_run_id = m.experiment_run_id\n AND a.scenario_name = m.scenario_name\nWHERE m.experiment_run_id::text = '$experiment_run_id'\n  AND m.scenario_name IN ($scenario_name)\nORDER BY m.sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Chi tiết accuracy theo window / category",
+      "description": "FULL OUTER JOIN: expected_present=false cho actual-only; actual_present=false cho missing window/category.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 42,
+        "w": 24,
+        "h": 11
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT scenario_name, topic, window_start, window_end, merchant_category,\n  expected_present, actual_present, expected_count, actual_count,\n  missing_count, extra_count, expected_amount, actual_amount,\n  count_accuracy_percent, amount_accuracy_percent,\n  expected_late_count, actual_late_count,\n  late_events_accepted, late_events_dropped, late_events_extra,\n  last_batch_id, manifest_sha256\nFROM streaming.window_accuracy_results\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY scenario_name, window_start, merchant_category\nLIMIT 2000",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Checkpoint và Spark run evidence",
+      "description": "Liên kết chính xác scenario với Spark run, checkpoint và khoảng batch dùng để tổng hợp metrics.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 53,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT sequence_number, scenario_name, spark_run_id, spark_query_id,\n  spark_checkpoint_location, spark_baseline_batch_id, spark_final_batch_id,\n  metric_batch_count, p95_checkpoint_commit_ms, max_watermark_at,\n  spark_status, pipeline_effective_status, metrics_bounds_complete\nFROM streaming.experiment_scenario_metrics\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Checkpoint restart verification",
+      "description": "Minh chứng dừng Spark, tạo backlog khi job đang dừng và khởi động lại cùng checkpoint: query_id giữ nguyên, spark_run_id thay đổi, offset phục hồi và accuracy xác nhận không mất/không trùng.",
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "postgres-streaming"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 62,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "postgres-streaming"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT sequence_number, scenario_name,\n  checkpoint_recovery_verified, no_loss_no_duplicates, accuracy_complete,\n  query_id_preserved, spark_run_changed, checkpoint_reused, offsets_recovered,\n  total_expected_count, total_actual_count, total_missing_count, total_extra_count,\n  phase1_delivered, downtime_delivered, backlog_event_count, topic,\n  before_spark_run_id, after_spark_run_id, before_query_id, after_query_id,\n  checkpoint_location\nFROM streaming.checkpoint_recovery_results\nWHERE experiment_run_id::text = '$experiment_run_id'\n  AND scenario_name IN ($scenario_name)\nORDER BY sequence_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    }
+  ],
+  "annotations": {
+    "list": []
+  }
+}

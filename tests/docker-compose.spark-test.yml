@@ -1,0 +1,11 @@
+services:
+  spark-test:
+    image: spark:4.2.0-scala2.13-java17-python3-ubuntu
+    working_dir: /workspace
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - RUN_SPARK_TESTS=1 /opt/spark/bin/spark-submit --master local[1] tests/test_spark_streaming.py -v
+    environment:
+      SPARK_LOCAL_HOSTNAME: localhost
+    volumes:
+      - ..:/workspace:ro

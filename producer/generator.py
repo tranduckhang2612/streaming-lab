@@ -8,7 +8,7 @@ import signal
 import sys
 import threading
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 from confluent_kafka import KafkaException, Producer
 
@@ -24,8 +24,15 @@ class DeliveryStats:
 
 
 class KafkaEventProducer:
-    def __init__(self, bootstrap_servers: str, client_id: str) -> None:
+    def __init__(
+        self,
+        bootstrap_servers: str,
+        client_id: str,
+        delivered_event_callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> None:
         self.stats = DeliveryStats()
+        self.manifest_error: str | None = None
+        self._delivered_event_callback = delivered_event_callback
         self._producer = Producer(
             {
                 "bootstrap.servers": bootstrap_servers,
@@ -59,12 +66,29 @@ class KafkaEventProducer:
             f"{timeout_seconds:g}s: {last_error}"
         )
 
-    def _delivery_callback(self, error: object, _message: object) -> None:
-        if error is None:
+    def _delivery_callback(self, event: dict[str, object]):
+        def callback(error: object, _message: object) -> None:
+            if error is not None:
+                self.stats.failed += 1
+                print(f"Delivery failed: {error}", file=sys.stderr, flush=True)
+                return
+
             self.stats.delivered += 1
-        else:
-            self.stats.failed += 1
-            print(f"Delivery failed: {error}", file=sys.stderr, flush=True)
+            if bool(event["simulated_late"]):
+                self.stats.simulated_late += 1
+            if self._delivered_event_callback is not None:
+                try:
+                    self._delivered_event_callback(event)
+                except OSError as exc:
+                    if self.manifest_error is None:
+                        self.manifest_error = str(exc)
+                    print(
+                        f"Failed to record delivered event: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+        return callback
 
     def send(self, topic: str, event: dict[str, object]) -> None:
         payload = json.dumps(
@@ -80,15 +104,13 @@ class KafkaEventProducer:
                     topic=topic,
                     key=key,
                     value=payload,
-                    on_delivery=self._delivery_callback,
+                    on_delivery=self._delivery_callback(event),
                 )
                 break
             except BufferError:
                 self._producer.poll(0.1)
 
         self.stats.attempted += 1
-        if bool(event["simulated_late"]):
-            self.stats.simulated_late += 1
         self._producer.poll(0)
 
     def poll(self) -> None:
@@ -166,6 +188,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=60.0,
     )
     parser.add_argument("--client-id", default="streaming-lab-generator")
+    parser.add_argument(
+        "--event-manifest",
+        help=(
+            "Optional JSONL file containing only events acknowledged by Kafka. "
+            "Used as the accuracy ground truth."
+        ),
+    )
     return parser
 
 
@@ -181,7 +210,21 @@ def run(args: argparse.Namespace) -> int:
         ),
         seed=args.seed,
     )
-    client = KafkaEventProducer(args.bootstrap_servers, args.client_id)
+    manifest_file = None
+    if args.event_manifest:
+        manifest_file = open(args.event_manifest, "w", encoding="utf-8")
+
+    def record_delivered_event(event: dict[str, object]) -> None:
+        assert manifest_file is not None
+        manifest_file.write(
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+
+    client = KafkaEventProducer(
+        args.bootstrap_servers,
+        args.client_id,
+        record_delivered_event if manifest_file is not None else None,
+    )
     stop_event = threading.Event()
 
     def request_stop(_signum: int, _frame: object) -> None:
@@ -235,6 +278,15 @@ def run(args: argparse.Namespace) -> int:
                 last_report_at = now
     finally:
         remaining = client.flush()
+        if manifest_file is not None:
+            try:
+                manifest_file.flush()
+                os.fsync(manifest_file.fileno())
+            except OSError as exc:
+                if client.manifest_error is None:
+                    client.manifest_error = str(exc)
+            finally:
+                manifest_file.close()
 
     elapsed = time.monotonic() - started_at
     final_rate = client.stats.delivered / max(elapsed, 0.001)
@@ -248,7 +300,13 @@ def run(args: argparse.Namespace) -> int:
         f"delivered_rate={final_rate:.1f}/s",
         flush=True,
     )
-    return 0 if client.stats.failed == 0 and remaining == 0 else 1
+    return (
+        0
+        if client.stats.failed == 0
+        and remaining == 0
+        and client.manifest_error is None
+        else 1
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

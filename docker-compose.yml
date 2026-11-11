@@ -233,6 +233,8 @@ services:
       - kafka:29092
       - --topic
       - "${SPARK_INPUT_TOPIC:-raw-events}"
+      - --starting-offsets
+      - "${SPARK_STARTING_OFFSETS:-earliest}"
       - --checkpoint-location
       - "${SPARK_CHECKPOINT_LOCATION:-}"
       - --watermark
@@ -243,6 +245,10 @@ services:
       - "${SPARK_WINDOW_DURATION:-1 minute}"
       - --trigger-interval
       - "${SPARK_TRIGGER_INTERVAL:-5 seconds}"
+      - --experiment-run-id
+      - "${SPARK_EXPERIMENT_RUN_ID:-}"
+      - --experiment-scenario-name
+      - "${SPARK_EXPERIMENT_SCENARIO_NAME:-}"
       - --postgres-host
       - postgres
       - --postgres-port
@@ -323,12 +329,15 @@ services:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin_password}
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DATE_FORMATS_DEFAULT_TIMEZONE: UTC
       POSTGRES_DB: ${POSTGRES_DB:-streaming_db}
       POSTGRES_USER: ${POSTGRES_USER:-streaming_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streaming_password}
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./docker/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./docker/grafana/dashboards:/etc/grafana/dashboards:ro
     depends_on:
       postgres:
         condition: service_healthy

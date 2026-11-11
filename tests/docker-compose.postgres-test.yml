@@ -1,0 +1,8 @@
+services:
+  postgres:
+    image: postgres:17.11-alpine
+    network_mode: none
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    tmpfs:
+      - /var/lib/postgresql/data

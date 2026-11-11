@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 from typing import Sequence
 
 from .config import GeneratorConfig, PROJECT_ROOT, RuntimeConfig
@@ -28,6 +31,10 @@ class Execution:
     return_code: int
     output: str
     summary: dict[str, str] | None
+    delivered_events: tuple[dict[str, object], ...] = ()
+    manifest_sha256: str | None = None
+    manifest_status: str = "unavailable"
+    manifest_error: str | None = None
 
 
 def utc_timestamp() -> str:
@@ -79,8 +86,9 @@ def build_command(
     config: GeneratorConfig,
     runtime: RuntimeConfig,
     client_id: str,
+    event_manifest: Path | None = None,
 ) -> list[str]:
-    return [
+    command = [
         "docker",
         "compose",
         "--profile",
@@ -89,6 +97,13 @@ def build_command(
         "--rm",
         "--no-deps",
         "-T",
+    ]
+    if event_manifest is not None:
+        command.extend([
+            "--volume",
+            f"{event_manifest.parent.resolve()}:/tmp/streaming-lab-evidence",
+        ])
+    command.extend([
         "event-generator",
         "--bootstrap-servers",
         runtime.bootstrap_servers,
@@ -114,7 +129,13 @@ def build_command(
         str(config.seed),
         "--client-id",
         client_id,
-    ]
+    ])
+    if event_manifest is not None:
+        command.extend([
+            "--event-manifest",
+            f"/tmp/streaming-lab-evidence/{event_manifest.name}",
+        ])
+    return command
 
 
 def execute(
@@ -124,9 +145,62 @@ def execute(
     log_path: Path | None = None,
     project_root: Path = PROJECT_ROOT,
 ) -> Execution:
-    command = build_command(config, runtime, client_id)
-    return_code, output = _run_and_capture(command, project_root, log_path)
-    return Execution(return_code, output, parse_summary(output))
+    with tempfile.TemporaryDirectory(prefix="streaming-lab-evidence-") as directory:
+        manifest_path = Path(directory) / "delivered-events.jsonl"
+        # Rootless Docker remaps container UIDs; a writable directory lets the
+        # container create the file without relying on host-file ownership.
+        Path(directory).chmod(0o777)
+        command = build_command(
+            config,
+            runtime,
+            client_id,
+            event_manifest=manifest_path,
+        )
+        return_code, output = _run_and_capture(command, project_root, log_path)
+        summary = parse_summary(output)
+        events, digest, status, error = _read_manifest(manifest_path, summary)
+        if status != "complete" and return_code == 0:
+            return_code = 1
+        return Execution(
+            return_code,
+            output,
+            summary,
+            tuple(events),
+            digest,
+            status,
+            error,
+        )
+
+
+def _read_manifest(
+    path: Path,
+    summary: dict[str, str] | None,
+) -> tuple[list[dict[str, object]], str | None, str, str | None]:
+    try:
+        raw = path.read_bytes()
+        events: list[dict[str, object]] = []
+        for line_number, raw_line in enumerate(raw.splitlines(), start=1):
+            if not raw_line.strip():
+                continue
+            value = json.loads(raw_line)
+            if not isinstance(value, dict):
+                raise ValueError(f"manifest line {line_number} is not an object")
+            events.append(value)
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        return [], None, "incomplete", str(exc)
+
+    digest = hashlib.sha256(raw).hexdigest()
+    if summary is None:
+        return events, digest, "incomplete", "generator summary is missing"
+    delivered = int(summary["delivered"])
+    if len(events) != delivered:
+        return (
+            events,
+            digest,
+            "incomplete",
+            f"manifest has {len(events)} events but Kafka acknowledged {delivered}",
+        )
+    return events, digest, "complete", None
 
 
 def _run_and_capture(
